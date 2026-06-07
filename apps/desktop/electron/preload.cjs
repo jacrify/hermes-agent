@@ -25,6 +25,7 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
   writeClipboard: text => ipcRenderer.invoke('hermes:writeClipboard', text),
   saveImageFromUrl: url => ipcRenderer.invoke('hermes:saveImageFromUrl', url),
   saveImageBuffer: (data, ext) => ipcRenderer.invoke('hermes:saveImageBuffer', { data, ext }),
+  uploadImageFile: (filePath, profile) => ipcRenderer.invoke('hermes:uploadImageFile', filePath, profile),
   saveClipboardImage: () => ipcRenderer.invoke('hermes:saveClipboardImage'),
   getPathForFile: file => {
     try {

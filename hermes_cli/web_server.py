@@ -146,6 +146,17 @@ _SESSION_HEADER_NAME = "X-Hermes-Session-Token"
 # than inlining ``True`` at every gate) so the WS endpoints and the SPA token
 # injection share a single, testable seam.
 _DASHBOARD_EMBEDDED_CHAT_ENABLED = True
+_DESKTOP_UPLOAD_IMAGE_EXTENSIONS = {
+    "image/bmp": ".bmp",
+    "image/gif": ".gif",
+    "image/jpeg": ".jpg",
+    "image/png": ".png",
+    "image/svg+xml": ".svg",
+    "image/tiff": ".tiff",
+    "image/webp": ".webp",
+    "image/x-icon": ".ico",
+}
+_DESKTOP_UPLOAD_IMAGE_MAX_BYTES = 25 * 1024 * 1024
 
 # Simple rate limiter for the reveal endpoint
 _reveal_timestamps: List[float] = []
@@ -1534,6 +1545,43 @@ async def speak_text(payload: TTSSpeakRequest):
         "data_url": f"data:{mime_type};base64,{encoded}",
         "mime_type": mime_type,
         "provider": result.get("provider"),
+    }
+
+
+@app.post("/api/desktop/uploads/images")
+async def desktop_upload_image(request: Request):
+    """Store a Desktop-provided image on the backend host and return its path.
+
+    Hermes Desktop can run on one machine while the active backend runs on
+    another. In that mode pasted screenshots initially exist only on the
+    Desktop host, so the backend cannot attach them by path. This endpoint
+    copies the bytes onto the backend host before ``image.attach`` sees the
+    reference.
+    """
+    content_type = (request.headers.get("content-type") or "").split(";", 1)[0].strip().lower()
+    ext = _DESKTOP_UPLOAD_IMAGE_EXTENSIONS.get(content_type)
+    if not ext:
+        raise HTTPException(status_code=415, detail="Unsupported image type")
+
+    body = await request.body()
+    if not body:
+        raise HTTPException(status_code=400, detail="Empty upload")
+    if len(body) > _DESKTOP_UPLOAD_IMAGE_MAX_BYTES:
+        raise HTTPException(status_code=413, detail="Image upload too large")
+
+    upload_dir = get_hermes_home() / "desktop-uploads" / "images"
+    upload_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+    filename = f"desktop_{stamp}_{secrets.token_hex(4)}{ext}"
+    target = upload_dir / filename
+    target.write_bytes(body)
+
+    return {
+        "ok": True,
+        "path": str(target),
+        "name": filename,
+        "size": len(body),
+        "content_type": content_type,
     }
 
 

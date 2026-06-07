@@ -183,6 +183,7 @@ export function extractDroppedFiles(transfer: DataTransfer): DroppedFile[] {
 
 interface ComposerActionsOptions {
   activeSessionId: string | null
+  activeGatewayProfile?: string | null
   currentCwd: string
   requestGateway: <T>(method: string, params?: Record<string, unknown>) => Promise<T>
 }
@@ -193,7 +194,12 @@ const attachToMain = (attachment: ComposerAttachment) => {
   requestComposerFocus('main')
 }
 
-export function useComposerActions({ activeSessionId, currentCwd, requestGateway }: ComposerActionsOptions) {
+export function useComposerActions({
+  activeGatewayProfile,
+  activeSessionId,
+  currentCwd,
+  requestGateway
+}: ComposerActionsOptions) {
   const { t } = useI18n()
   const copy = t.desktop
   const addTextToDraft = useCallback((text: string) => {
@@ -279,35 +285,43 @@ export function useComposerActions({ activeSessionId, currentCwd, requestGateway
     [currentCwd]
   )
 
-  const attachImagePath = useCallback(async (filePath: string) => {
-    if (!filePath) {
-      return false
-    }
-
-    const baseAttachment: ComposerAttachment = {
-      id: attachmentId('image', filePath),
-      kind: 'image',
-      label: pathLabel(filePath),
-      detail: filePath,
-      path: filePath
-    }
-
-    attachToMain(baseAttachment)
-
-    try {
-      const previewUrl = await window.hermesDesktop?.readFileDataUrl(filePath)
-
-      if (previewUrl) {
-        addComposerAttachment({ ...baseAttachment, previewUrl })
+  const attachImagePath = useCallback(
+    async (filePath: string) => {
+      if (!filePath) {
+        return false
       }
 
-      return true
-    } catch (err) {
-      notifyError(err, copy.imagePreviewFailed)
+      let previewUrl: string | undefined
 
-      return true
-    }
-  }, [])
+      try {
+        previewUrl = await window.hermesDesktop?.readFileDataUrl(filePath)
+      } catch (err) {
+        notifyError(err, copy.imagePreviewFailed)
+      }
+
+      try {
+        const upload = await window.hermesDesktop?.uploadImageFile?.(filePath, activeGatewayProfile)
+        const attachPath = upload?.path || filePath
+        const attachment: ComposerAttachment = {
+          id: attachmentId('image', attachPath),
+          kind: 'image',
+          label: pathLabel(attachPath),
+          detail: attachPath,
+          path: attachPath,
+          ...(previewUrl ? { previewUrl } : {})
+        }
+
+        attachToMain(attachment)
+
+        return true
+      } catch (err) {
+        notifyError(err, copy.imageAttachFailed)
+
+        return false
+      }
+    },
+    [activeGatewayProfile, copy.imageAttachFailed, copy.imagePreviewFailed]
+  )
 
   const attachImageBlob = useCallback(
     async (blob: Blob) => {

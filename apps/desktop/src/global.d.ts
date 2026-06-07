@@ -35,6 +35,7 @@ declare global {
       writeClipboard: (text: string) => Promise<boolean>
       saveImageFromUrl: (url: string) => Promise<boolean>
       saveImageBuffer: (data: ArrayBuffer | Uint8Array, ext: string) => Promise<string>
+      uploadImageFile: (filePath: string, profile?: string | null) => Promise<HermesImageUploadResult>
       saveClipboardImage: () => Promise<string>
       getPathForFile: (file: File) => string
       normalizePreviewTarget: (target: string, baseDir?: string) => Promise<HermesPreviewTarget | null>
@@ -207,6 +208,14 @@ export interface HermesWindowState {
   isFullscreen: boolean
   nativeOverlayWidth: number
   windowButtonPosition: { x: number; y: number } | null
+}
+
+export interface HermesImageUploadResult {
+  content_type?: string
+  mode: 'local' | 'remote'
+  name?: string
+  path: string
+  size?: number
 }
 
 export interface DesktopActiveProfile {

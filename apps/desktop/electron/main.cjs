@@ -2387,6 +2387,128 @@ function fetchJson(url, token, options = {}) {
   })
 }
 
+function parseJsonResponseText(url, statusCode, headers, text) {
+  if (statusCode >= 400) {
+    throw new Error(`${statusCode}: ${text || ''}`)
+  }
+  if (!text) {
+    return null
+  }
+  const looksHtml = /^\s*<(?:!doctype|html)/i.test(text)
+  const contentType = String(headers['content-type'] || headers['Content-Type'] || '')
+  if (looksHtml || contentType.includes('text/html')) {
+    throw new Error(`Expected JSON from ${url} but got HTML (status ${statusCode}).`)
+  }
+  try {
+    return JSON.parse(text)
+  } catch {
+    throw new Error(`Invalid JSON from ${url} (status ${statusCode}): ${text.slice(0, 200)}`)
+  }
+}
+
+function fetchBinaryJson(url, token, buffer, options = {}) {
+  return new Promise((resolve, reject) => {
+    let parsed
+    try {
+      parsed = new URL(url)
+    } catch (error) {
+      reject(new Error(`Invalid URL: ${error.message}`))
+      return
+    }
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      reject(new Error(`Unsupported Hermes backend URL protocol: ${parsed.protocol}`))
+      return
+    }
+
+    const client = parsed.protocol === 'https:' ? https : http
+    const body = Buffer.isBuffer(buffer) ? buffer : Buffer.from(buffer)
+    const timeoutMs = resolveTimeoutMs(options.timeoutMs, DEFAULT_FETCH_TIMEOUT_MS)
+    const req = client.request(
+      parsed,
+      {
+        method: options.method || 'POST',
+        headers: {
+          'Content-Type': options.contentType || 'application/octet-stream',
+          'Content-Length': String(body.length),
+          'X-Hermes-Session-Token': token
+        }
+      },
+      res => {
+        const chunks = []
+        res.on('error', reject)
+        res.on('data', chunk => chunks.push(chunk))
+        res.on('end', () => {
+          try {
+            resolve(parseJsonResponseText(url, res.statusCode || 500, res.headers, Buffer.concat(chunks).toString('utf8')))
+          } catch (error) {
+            reject(error)
+          }
+        })
+      }
+    )
+
+    req.on('error', reject)
+    req.setTimeout(timeoutMs, () => {
+      req.destroy(new Error(`Timed out connecting to Hermes backend after ${timeoutMs}ms`))
+    })
+    req.write(body)
+    req.end()
+  })
+}
+
+function fetchBinaryJsonViaOauthSession(url, buffer, options = {}) {
+  return new Promise((resolve, reject) => {
+    const sess = getOauthSession()
+    if (!sess) {
+      reject(new Error('OAuth session partition is unavailable.'))
+      return
+    }
+    const body = Buffer.isBuffer(buffer) ? buffer : Buffer.from(buffer)
+    const timeoutMs = resolveTimeoutMs(options.timeoutMs, DEFAULT_FETCH_TIMEOUT_MS)
+    const request = electronNet.request({
+      method: options.method || 'POST',
+      url,
+      session: sess,
+      useSessionCookies: true,
+      redirect: 'follow'
+    })
+    request.setHeader('Content-Type', options.contentType || 'application/octet-stream')
+    request.setHeader('Content-Length', String(body.length))
+
+    let timedOut = false
+    const timer = setTimeout(() => {
+      timedOut = true
+      try {
+        request.abort()
+      } catch {
+        // already finished
+      }
+      reject(new Error(`Timed out connecting to Hermes backend after ${timeoutMs}ms`))
+    }, timeoutMs)
+
+    request.on('response', res => {
+      const chunks = []
+      res.on('data', chunk => chunks.push(Buffer.from(chunk)))
+      res.on('end', () => {
+        if (timedOut) return
+        clearTimeout(timer)
+        try {
+          resolve(parseJsonResponseText(url, res.statusCode || 500, res.headers, Buffer.concat(chunks).toString('utf8')))
+        } catch (error) {
+          reject(error)
+        }
+      })
+    })
+    request.on('error', error => {
+      if (timedOut) return
+      clearTimeout(timer)
+      reject(error)
+    })
+    request.write(body)
+    request.end()
+  })
+}
+
 function fetchPublicJson(url, options = {}) {
   // Credential-free JSON GET/POST for public gateway endpoints
   // (``/api/status``, ``/api/auth/providers``). Unlike ``fetchJson`` it sends
@@ -2802,6 +2924,37 @@ async function writeComposerImage(buffer, ext = '.png') {
   const filePath = path.join(dir, `composer_${stamp}_${random}${safeExt}`)
   await fs.promises.writeFile(filePath, buffer)
   return filePath
+}
+
+async function uploadImageFileToBackend(filePath, profile) {
+  const connection = await ensureBackend(profile)
+  const rawPath = String(filePath || '')
+
+  if (connection.mode !== 'remote') {
+    return { mode: 'local', path: rawPath }
+  }
+
+  const { resolvedPath } = await resolveReadableFileForIpc(rawPath, {
+    maxBytes: 25 * 1024 * 1024,
+    purpose: 'Image upload'
+  })
+  const mimeType = mimeTypeForPath(resolvedPath)
+  if (!mimeType.startsWith('image/')) {
+    throw new Error('Only image files can be uploaded as image attachments.')
+  }
+
+  const buffer = await fs.promises.readFile(resolvedPath)
+  const url = `${connection.baseUrl}/api/desktop/uploads/images`
+  const result =
+    connection.authMode === 'oauth'
+      ? await fetchBinaryJsonViaOauthSession(url, buffer, { contentType: mimeType })
+      : await fetchBinaryJson(url, connection.token, buffer, { contentType: mimeType })
+
+  if (!result?.path) {
+    throw new Error('Remote image upload did not return a path.')
+  }
+
+  return { mode: 'remote', ...result }
 }
 
 function previewLabelForUrl(url) {
@@ -5106,6 +5259,8 @@ ipcMain.handle('hermes:saveImageBuffer', async (_event, payload) => {
   const buffer = Buffer.isBuffer(data) ? data : Buffer.from(data)
   return writeComposerImage(buffer, payload?.ext || '.png')
 })
+
+ipcMain.handle('hermes:uploadImageFile', async (_event, filePath, profile) => uploadImageFileToBackend(filePath, profile))
 
 ipcMain.handle('hermes:saveClipboardImage', async () => {
   const image = clipboard.readImage()

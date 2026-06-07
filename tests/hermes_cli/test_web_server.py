@@ -243,6 +243,46 @@ class TestWebServerEndpoints:
         assert "hermes_home" in data
         assert "active_sessions" in data
 
+    def test_desktop_image_upload_stores_backend_file(self):
+        """Remote Desktop image uploads land on the backend host.
+
+        A desktop running on macOS can be attached to a Linux/Pi backend. In
+        that shape, pasted screenshots must be copied to the backend before
+        ``image.attach`` receives the path; otherwise the backend sees a
+        Mac-only Application Support path and reports "image not found".
+        """
+        from hermes_constants import get_hermes_home
+
+        payload = b"\x89PNG\r\n\x1a\nfake-png"
+        resp = self.client.post(
+            "/api/desktop/uploads/images",
+            content=payload,
+            headers={"content-type": "image/png"},
+        )
+
+        assert resp.status_code == 200
+        data = resp.json()
+        saved = Path(data["path"])
+        assert saved.parent == get_hermes_home() / "desktop-uploads" / "images"
+        assert saved.name.startswith("desktop_")
+        assert saved.suffix == ".png"
+        assert saved.read_bytes() == payload
+        assert data["size"] == len(payload)
+        assert data["content_type"] == "image/png"
+
+    def test_desktop_image_upload_rejects_non_image(self):
+        from hermes_constants import get_hermes_home
+
+        resp = self.client.post(
+            "/api/desktop/uploads/images",
+            content=b"hello",
+            headers={"content-type": "text/plain"},
+        )
+
+        assert resp.status_code == 415
+        upload_dir = get_hermes_home() / "desktop-uploads" / "images"
+        assert not upload_dir.exists()
+
     def test_get_sessions_uses_only_persisted_cwd(self, monkeypatch):
         """Session rows without persisted cwd must not inherit TERMINAL_CWD.
 
