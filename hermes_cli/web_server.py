@@ -201,6 +201,8 @@ _DESKTOP_UPLOAD_IMAGE_EXTENSIONS = {
     "image/x-icon": ".ico",
 }
 _DESKTOP_UPLOAD_IMAGE_MAX_BYTES = 25 * 1024 * 1024
+_REALTIME_SDP_MAX_BYTES = 512 * 1024
+_OPENAI_REALTIME_CALLS_URL = "https://api.openai.com/v1/realtime/calls"
 
 # Simple rate limiter for the reveal endpoint
 _reveal_timestamps: List[float] = []
@@ -1554,6 +1556,160 @@ async def transcribe_audio_upload(payload: AudioTranscriptionRequest):
         "transcript": str(result.get("transcript") or "").strip(),
         "provider": result.get("provider"),
     }
+
+
+def _resolve_realtime_openai_key() -> str:
+    env = load_env()
+    return (
+        os.environ.get("VOICE_TOOLS_OPENAI_KEY", "").strip()
+        or os.environ.get("OPENAI_API_KEY", "").strip()
+        or str(env.get("VOICE_TOOLS_OPENAI_KEY") or "").strip()
+        or str(env.get("OPENAI_API_KEY") or "").strip()
+    )
+
+
+def _default_realtime_session_config() -> Dict[str, Any]:
+    cfg = load_config()
+    realtime_cfg = cfg.get("realtime", {})
+    if not isinstance(realtime_cfg, dict):
+        realtime_cfg = {}
+    model = (
+        os.environ.get("HERMES_REALTIME_MODEL", "").strip()
+        or str(realtime_cfg.get("model", "") or "").strip()
+        or "gpt-realtime"
+    )
+    voice = (
+        os.environ.get("HERMES_REALTIME_VOICE", "").strip()
+        or str(realtime_cfg.get("voice", "") or "").strip()
+        or "marin"
+    )
+    return {
+        "type": "realtime",
+        "model": model,
+        "instructions": (
+            "You are Hermes voice mode, running as a first-slice realtime "
+            "voice prototype inside the Hermes dashboard. No tools are "
+            "available yet. Keep replies concise and conversational."
+        ),
+        "audio": {
+            "output": {
+                "voice": voice,
+            },
+        },
+        "tools": [],
+    }
+
+
+def _multipart_realtime_call_body(
+    *,
+    sdp: str,
+    session: Dict[str, Any],
+    boundary: str,
+) -> bytes:
+    session_json = json.dumps(session, separators=(",", ":"))
+    parts = [
+        (
+            f"--{boundary}\r\n"
+            'Content-Disposition: form-data; name="sdp"\r\n'
+            "Content-Type: application/sdp\r\n\r\n"
+            f"{sdp}\r\n"
+        ),
+        (
+            f"--{boundary}\r\n"
+            'Content-Disposition: form-data; name="session"\r\n'
+            "Content-Type: application/json\r\n\r\n"
+            f"{session_json}\r\n"
+        ),
+        f"--{boundary}--\r\n",
+    ]
+    return "".join(parts).encode("utf-8")
+
+
+def _post_openai_realtime_call(
+    *,
+    sdp: str,
+    session: Dict[str, Any],
+    api_key: str,
+) -> Tuple[str, Optional[str]]:
+    boundary = f"hermes-realtime-{secrets.token_hex(16)}"
+    body = _multipart_realtime_call_body(
+        sdp=sdp,
+        session=session,
+        boundary=boundary,
+    )
+    req = urllib.request.Request(
+        _OPENAI_REALTIME_CALLS_URL,
+        data=body,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+            "Accept": "application/sdp",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=30) as res:
+        answer = res.read().decode("utf-8")
+        call_id = res.headers.get("Location")
+    return answer, call_id
+
+
+@app.post("/api/realtime/voice/sdp")
+async def create_realtime_voice_sdp(request: Request):
+    """Create a no-tools OpenAI Realtime WebRTC call for the dashboard overlay."""
+    content_type = (request.headers.get("content-type") or "").split(";", 1)[0].strip().lower()
+    if content_type != "application/sdp":
+        raise HTTPException(status_code=415, detail="Expected application/sdp")
+
+    raw = await request.body()
+    if not raw:
+        raise HTTPException(status_code=400, detail="SDP offer is empty")
+    if len(raw) > _REALTIME_SDP_MAX_BYTES:
+        raise HTTPException(status_code=413, detail="SDP offer is too large")
+
+    try:
+        sdp = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        raise HTTPException(status_code=400, detail="SDP offer must be UTF-8 text")
+
+    if "v=0" not in sdp[:128] or "m=audio" not in sdp:
+        raise HTTPException(status_code=400, detail="SDP offer does not contain audio")
+
+    api_key = _resolve_realtime_openai_key()
+    if not api_key:
+        raise HTTPException(
+            status_code=503,
+            detail="Set VOICE_TOOLS_OPENAI_KEY or OPENAI_API_KEY to use realtime voice",
+        )
+
+    session = _default_realtime_session_config()
+    try:
+        answer_sdp, call_id = await asyncio.to_thread(
+            _post_openai_realtime_call,
+            sdp=sdp,
+            session=session,
+            api_key=api_key,
+        )
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")[:1000]
+        _log.warning("OpenAI realtime voice call failed: HTTP %s %s", exc.code, body)
+        raise HTTPException(
+            status_code=502,
+            detail=f"OpenAI realtime call failed with HTTP {exc.code}: {body}",
+        )
+    except urllib.error.URLError as exc:
+        _log.warning("OpenAI realtime voice call connection failed: %s", exc)
+        raise HTTPException(
+            status_code=502,
+            detail=f"OpenAI realtime call connection failed: {exc.reason}",
+        )
+    except Exception as exc:
+        _log.exception("OpenAI realtime voice call failed")
+        raise HTTPException(status_code=502, detail=f"OpenAI realtime call failed: {exc}")
+
+    headers = {"Cache-Control": "no-store"}
+    if call_id:
+        headers["X-Hermes-Realtime-Call"] = call_id
+    return Response(content=answer_sdp, media_type="application/sdp", headers=headers)
 
 
 class TTSSpeakRequest(BaseModel):
