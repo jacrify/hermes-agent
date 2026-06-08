@@ -82,6 +82,7 @@ import ChannelsPage from "@/pages/ChannelsPage";
 import WebhooksPage from "@/pages/WebhooksPage";
 import SystemPage from "@/pages/SystemPage";
 import ChatPage from "@/pages/ChatPage";
+import RealtimePage from "@/pages/RealtimePage";
 import { LanguageSwitcher } from "@/components/LanguageSwitcher";
 import { ThemeSwitcher } from "@/components/ThemeSwitcher";
 import { useI18n } from "@/i18n";
@@ -112,6 +113,12 @@ const CHAT_NAV_ITEM: NavItem = {
   icon: Terminal,
 };
 
+const REALTIME_NAV_ITEM: NavItem = {
+  path: "/realtime",
+  label: "Realtime",
+  icon: Radio,
+};
+
 /**
  * Built-in routes except /chat.  Chat is rendered persistently (outside
  * <Routes>) when embedded — see the persistent chat host block rendered
@@ -133,6 +140,7 @@ const BUILTIN_ROUTES_CORE: Record<string, ComponentType> = {
   "/mcp": McpPage,
   "/pairing": PairingPage,
   "/channels": ChannelsPage,
+  "/realtime": RealtimePage,
   "/webhooks": WebhooksPage,
   "/system": SystemPage,
   "/profiles": ProfilesPage,
@@ -415,8 +423,8 @@ export default function App() {
 
   const builtinNav = useMemo(() => {
     const base = embeddedChat
-      ? [CHAT_NAV_ITEM, ...BUILTIN_NAV_REST]
-      : BUILTIN_NAV_REST;
+      ? [CHAT_NAV_ITEM, REALTIME_NAV_ITEM, ...BUILTIN_NAV_REST]
+      : [REALTIME_NAV_ITEM, ...BUILTIN_NAV_REST];
     return showTokenAnalytics
       ? base
       : base.filter((n) => n.path !== "/analytics");

@@ -32,7 +32,6 @@ import { createPortal } from "react-dom";
 import { useSearchParams } from "react-router-dom";
 
 import { ChatSidebar } from "@/components/ChatSidebar";
-import { RealtimeVoiceOverlay } from "@/components/RealtimeVoiceOverlay";
 import { usePageHeader } from "@/contexts/usePageHeader";
 import { useI18n } from "@/i18n";
 import { api } from "@/lib/api";
@@ -885,8 +884,6 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
             ref={hostRef}
             className="hermes-chat-xterm-host min-h-0 min-w-0 flex-1"
           />
-
-          <RealtimeVoiceOverlay active={isActive} />
 
           <Button
             ghost
