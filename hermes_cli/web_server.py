@@ -9,7 +9,7 @@ Usage:
     python -m hermes_cli.main web --port 8080
 """
 
-from contextlib import asynccontextmanager, contextmanager
+from contextlib import asynccontextmanager
 
 import asyncio
 import base64
@@ -32,7 +32,6 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -204,7 +203,6 @@ _DESKTOP_UPLOAD_IMAGE_EXTENSIONS = {
 _DESKTOP_UPLOAD_IMAGE_MAX_BYTES = 25 * 1024 * 1024
 _REALTIME_SDP_MAX_BYTES = 512 * 1024
 _OPENAI_REALTIME_CALLS_URL = "https://api.openai.com/v1/realtime/calls"
-_REALTIME_BACKGROUND_AGENT_TOOL_NAME = "start_background_agent"
 _REALTIME_UNSUPPORTED_AGENT_LOOP_TOOLS = {
     "delegate_task",
     "memory",
@@ -212,10 +210,6 @@ _REALTIME_UNSUPPORTED_AGENT_LOOP_TOOLS = {
     "todo",
 }
 _REALTIME_TOOL_RESULT_MAX_CHARS = 12000
-_REALTIME_KNOWN_WORKSPACE_CANDIDATES = (
-    "/home/john/.picoclaw/workspace/obsidian/Master",
-    "/Users/john/obsidian/Master",
-)
 
 # Simple rate limiter for the reveal endpoint
 _reveal_timestamps: List[float] = []
@@ -1606,154 +1600,6 @@ def _realtime_enabled_toolsets(config: Optional[Dict[str, Any]] = None) -> List[
         return []
 
 
-def _realtime_config_dict(config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    cfg = config if isinstance(config, dict) else load_config()
-    realtime_cfg = cfg.get("realtime", {}) if isinstance(cfg, dict) else {}
-    return realtime_cfg if isinstance(realtime_cfg, dict) else {}
-
-
-def _coerce_existing_dir(value: Any) -> Optional[Path]:
-    if not isinstance(value, str) or not value.strip():
-        return None
-    try:
-        path = Path(value).expanduser()
-    except Exception:
-        return None
-    return path if path.is_dir() else None
-
-
-def _resolve_realtime_cwd(
-    config: Optional[Dict[str, Any]] = None,
-    *,
-    requested_cwd: Optional[str] = None,
-) -> Path:
-    cfg = config if isinstance(config, dict) else load_config()
-    realtime_cfg = _realtime_config_dict(cfg)
-    terminal_cfg = cfg.get("terminal", {}) if isinstance(cfg, dict) else {}
-    if not isinstance(terminal_cfg, dict):
-        terminal_cfg = {}
-
-    candidates: List[Any] = [
-        requested_cwd,
-        os.environ.get("HERMES_REALTIME_CWD"),
-        realtime_cfg.get("cwd"),
-        *_REALTIME_KNOWN_WORKSPACE_CANDIDATES,
-        terminal_cfg.get("cwd"),
-        os.environ.get("TERMINAL_CWD"),
-    ]
-    for candidate in candidates:
-        path = _coerce_existing_dir(candidate)
-        if path:
-            return path
-    return Path(os.getcwd())
-
-
-@contextmanager
-def _scoped_realtime_cwd(cwd: Path):
-    """Make runtime cwd, prompt context, and terminal tools agree for voice."""
-    token = None
-    old_terminal_cwd = os.environ.get("TERMINAL_CWD")
-    old_hermes_cwd = os.environ.get("HERMES_CWD")
-    try:
-        from agent.runtime_cwd import reset_session_cwd, set_session_cwd
-
-        token = set_session_cwd(str(cwd))
-        os.environ["TERMINAL_CWD"] = str(cwd)
-        os.environ["HERMES_CWD"] = str(cwd)
-        yield
-    finally:
-        if token is not None:
-            try:
-                reset_session_cwd(token)
-            except Exception:
-                pass
-        if old_terminal_cwd is None:
-            os.environ.pop("TERMINAL_CWD", None)
-        else:
-            os.environ["TERMINAL_CWD"] = old_terminal_cwd
-        if old_hermes_cwd is None:
-            os.environ.pop("HERMES_CWD", None)
-        else:
-            os.environ["HERMES_CWD"] = old_hermes_cwd
-
-
-def _realtime_extra_voice_instructions(config: Optional[Dict[str, Any]] = None) -> str:
-    env_value = os.environ.get("HERMES_REALTIME_INSTRUCTIONS", "").strip()
-    if env_value:
-        return env_value
-    realtime_cfg = _realtime_config_dict(config)
-    for key in ("instructions", "voice_instructions", "system_prompt"):
-        value = realtime_cfg.get(key)
-        if isinstance(value, str) and value.strip():
-            return value.strip()
-    return ""
-
-
-def _normal_agent_context_for_realtime(cwd: Path) -> str:
-    """Best-effort reuse of normal Hermes identity and project context."""
-    parts: List[str] = []
-    try:
-        from agent.prompt_builder import (
-            DEFAULT_AGENT_IDENTITY,
-            build_context_files_prompt,
-            load_soul_md,
-        )
-
-        with _scoped_realtime_cwd(cwd):
-            soul = load_soul_md()
-            parts.append(soul.strip() if soul else DEFAULT_AGENT_IDENTITY.strip())
-            context_prompt = build_context_files_prompt(cwd=str(cwd), skip_soul=bool(soul))
-            if context_prompt.strip():
-                parts.append(context_prompt.strip())
-    except Exception:
-        _log.debug("Realtime voice could not build normal agent context", exc_info=True)
-    return "\n\n".join(part for part in parts if part)
-
-
-def _realtime_background_agent_tool_definition() -> Dict[str, Any]:
-    return {
-        "type": "function",
-        "name": _REALTIME_BACKGROUND_AGENT_TOOL_NAME,
-        "description": (
-            "Start a full Hermes background agent session for substantial work. "
-            "Returns immediately with a session_id and dashboard resume path; "
-            "the result appears in the normal Hermes Sessions/Chat UI."
-        ),
-        "parameters": {
-            "type": "object",
-            "additionalProperties": False,
-            "properties": {
-                "prompt": {
-                    "type": "string",
-                    "description": "The complete instruction for the background Hermes agent.",
-                },
-                "title": {
-                    "type": "string",
-                    "description": "Optional short label for the session list.",
-                },
-                "cwd": {
-                    "type": "string",
-                    "description": "Optional absolute working directory. Defaults to the voice workspace.",
-                },
-                "toolsets": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "Optional Hermes toolsets/MCP names to enable. Omit to use normal CLI config.",
-                },
-                "model": {
-                    "type": "string",
-                    "description": "Optional text-agent model override.",
-                },
-                "provider": {
-                    "type": "string",
-                    "description": "Optional provider override; use with model.",
-                },
-            },
-            "required": ["prompt"],
-        },
-    }
-
-
 def _tool_name_from_definition(tool_def: Dict[str, Any]) -> str:
     name = tool_def.get("name")
     if isinstance(name, str) and name.strip():
@@ -1820,7 +1666,6 @@ def _realtime_tool_definitions(
         realtime_tool = _realtime_tool_definition(tool_def)
         if realtime_tool:
             filtered.append(realtime_tool)
-    filtered.append(_realtime_background_agent_tool_definition())
     return filtered, enabled_toolsets, sorted(skipped)
 
 
@@ -1828,38 +1673,21 @@ def _realtime_voice_instructions(
     *,
     tool_count: int,
     skipped_tools: List[str],
-    cwd: Path,
-    config: Optional[Dict[str, Any]] = None,
 ) -> str:
     skipped_note = ""
     if skipped_tools:
         skipped_note = (
             "\nSome normal Hermes agent-loop tools are not available in this "
             f"voice slice yet: {', '.join(skipped_tools)}. If the user asks "
-            "for blocking delegation, memory writes, todos, or session search, "
-            "say that voice can use external tools now and can start a full "
-            "background Hermes session with start_background_agent for larger work."
+            "for those, say that voice can use external tools now but that "
+            "agent-loop memory/planning/delegation needs the next integration."
         )
-    extra = _realtime_extra_voice_instructions(config)
-    extra_note = f"\n\nVoice-specific instructions:\n{extra}" if extra else ""
-    normal_context = _normal_agent_context_for_realtime(cwd)
-    context_note = (
-        f"\n\nNormal Hermes context follows. Treat it as durable identity and "
-        f"workspace guidance, adapted for this voice session.\n\n{normal_context}"
-        if normal_context
-        else ""
-    )
     return (
         "You are Hermes voice mode inside John's Hermes dashboard. "
         "Speak naturally, briefly, and clearly. You are allowed to call the "
         f"Hermes server tools exposed in this session ({tool_count} tools). "
-        f"Current voice workspace: {cwd}. Resolve relative paths against this "
-        "directory unless John gives an absolute path. "
         "The tools execute on John's Hermes server, so never claim you used a "
         "tool until the tool result has been returned. "
-        "For substantial tasks that would take more than a quick tool call or "
-        "two, use start_background_agent to create a normal Hermes session and "
-        "tell John the returned session id/resume path. "
         "For MCP or plugin tools hidden behind Tool Search, use tool_search to "
         "find candidates, tool_describe to inspect the schema, then tool_call "
         "to invoke the selected tool. "
@@ -1869,8 +1697,6 @@ def _realtime_voice_instructions(
         "offer to continue. "
         "If no tool is needed, just answer conversationally."
         f"{skipped_note}"
-        f"{extra_note}"
-        f"{context_note}"
     )
 
 
@@ -1889,7 +1715,6 @@ def _default_realtime_session_config() -> Dict[str, Any]:
         or str(realtime_cfg.get("voice", "") or "").strip()
         or "marin"
     )
-    cwd = _resolve_realtime_cwd(cfg)
     tools, _enabled_toolsets, skipped_tools = _realtime_tool_definitions(config=cfg)
     return {
         "type": "realtime",
@@ -1897,8 +1722,6 @@ def _default_realtime_session_config() -> Dict[str, Any]:
         "instructions": _realtime_voice_instructions(
             tool_count=len(tools),
             skipped_tools=skipped_tools,
-            cwd=cwd,
-            config=cfg,
         ),
         "audio": {
             "output": {
@@ -1973,139 +1796,12 @@ def _truncate_realtime_tool_output(output: str) -> str:
     )
 
 
-def _normalise_realtime_toolsets(value: Any) -> List[str]:
-    if not value:
-        return []
-    raw_items = value if isinstance(value, list) else [value]
-    toolsets: List[str] = []
-    for item in raw_items:
-        if isinstance(item, str):
-            toolsets.extend(part.strip() for part in item.split(",") if part.strip())
-        elif item is not None:
-            text = str(item).strip()
-            if text:
-                toolsets.append(text)
-    return toolsets
-
-
-def _set_realtime_background_session_title_later(session_id: str, title: str) -> None:
-    if not title.strip():
-        return
-
-    def _worker() -> None:
-        for _ in range(40):
-            try:
-                time.sleep(0.5)
-                from hermes_state import SessionDB
-
-                db = SessionDB()
-                if db.get_session(session_id):
-                    db.set_session_title(session_id, title[:120])
-                    return
-            except Exception:
-                _log.debug("Realtime background title update failed", exc_info=True)
-
-    threading.Thread(
-        target=_worker,
-        name=f"realtime-bg-title-{session_id}",
-        daemon=True,
-    ).start()
-
-
-def _start_realtime_background_agent(arguments: Dict[str, Any]) -> str:
-    prompt = str(arguments.get("prompt") or "").strip()
-    if not prompt:
-        return json.dumps(
-            {"error": "start_background_agent requires a non-empty prompt", "status": "error"},
-            ensure_ascii=False,
-        )
-
-    cfg = load_config()
-    cwd = _resolve_realtime_cwd(cfg, requested_cwd=arguments.get("cwd"))
-    session_id = f"voice_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
-    title = str(arguments.get("title") or "").strip()
-    model = str(arguments.get("model") or "").strip()
-    provider = str(arguments.get("provider") or "").strip()
-    toolsets = _normalise_realtime_toolsets(arguments.get("toolsets"))
-
-    cmd = [sys.executable, "-m", "hermes_cli.main"]
-    if model:
-        cmd.extend(["--model", model])
-    if provider:
-        cmd.extend(["--provider", provider])
-    if toolsets:
-        cmd.extend(["--toolsets", ",".join(toolsets)])
-    cmd.extend(["--oneshot", prompt])
-
-    logs_dir = get_hermes_home() / "logs"
-    logs_dir.mkdir(parents=True, exist_ok=True)
-    log_path = logs_dir / f"realtime-background-{session_id}.log"
-
-    env = os.environ.copy()
-    pythonpath_parts = [str(PROJECT_ROOT)]
-    if env.get("PYTHONPATH"):
-        pythonpath_parts.append(env["PYTHONPATH"])
-    env["PYTHONPATH"] = os.pathsep.join(pythonpath_parts)
-    env["HERMES_ONESHOT_SESSION_ID"] = session_id
-    env["HERMES_ONESHOT_DISABLE_YOLO"] = "1"
-    env["HERMES_SESSION_SOURCE"] = "voice"
-    env["TERMINAL_CWD"] = str(cwd)
-    env["HERMES_CWD"] = str(cwd)
-    env.pop("HERMES_YOLO_MODE", None)
-
-    try:
-        log_handle = open(log_path, "ab")
-        try:
-            proc = subprocess.Popen(
-                cmd,
-                cwd=str(cwd),
-                env=env,
-                stdout=log_handle,
-                stderr=subprocess.STDOUT,
-                start_new_session=True,
-            )
-        finally:
-            log_handle.close()
-    except Exception as exc:
-        _log.exception("Realtime voice failed to start background agent")
-        return json.dumps(
-            {"error": f"Failed to start background agent: {exc}", "status": "error"},
-            ensure_ascii=False,
-        )
-
-    if title:
-        _set_realtime_background_session_title_later(session_id, title)
-
-    return json.dumps(
-        {
-            "ok": True,
-            "status": "started",
-            "session_id": session_id,
-            "pid": proc.pid,
-            "cwd": str(cwd),
-            "dashboard_path": "/sessions",
-            "resume_path": f"/chat?resume={urllib.parse.quote(session_id)}",
-            "log_path": str(log_path),
-            "message": (
-                "Started a full Hermes background agent session. "
-                "Open resume_path to inspect or continue it in the normal chat UI."
-            ),
-        },
-        ensure_ascii=False,
-    )
-
-
 def _execute_realtime_tool_call(
     *,
     name: str,
     arguments: Dict[str, Any],
     call_id: str,
 ) -> str:
-    if name == _REALTIME_BACKGROUND_AGENT_TOOL_NAME:
-        return _truncate_realtime_tool_output(
-            _start_realtime_background_agent(arguments if isinstance(arguments, dict) else {})
-        )
-
     if name in _REALTIME_UNSUPPORTED_AGENT_LOOP_TOOLS:
         return json.dumps(
             {
@@ -2143,17 +1839,15 @@ def _execute_realtime_tool_call(
     try:
         import model_tools
 
-        cwd = _resolve_realtime_cwd()
-        with _scoped_realtime_cwd(cwd):
-            result = model_tools.handle_function_call(
-                function_name=name,
-                function_args=arguments if isinstance(arguments, dict) else {},
-                task_id="realtime-voice",
-                tool_call_id=call_id,
-                session_id="realtime-voice",
-                user_task="Hermes realtime voice conversation",
-                enabled_toolsets=enabled_toolsets,
-            )
+        result = model_tools.handle_function_call(
+            function_name=name,
+            function_args=arguments if isinstance(arguments, dict) else {},
+            task_id="realtime-voice",
+            tool_call_id=call_id,
+            session_id="realtime-voice",
+            user_task="Hermes realtime voice conversation",
+            enabled_toolsets=enabled_toolsets,
+        )
     except Exception as exc:
         _log.exception("Realtime voice tool call failed: %s", name)
         result = json.dumps(
