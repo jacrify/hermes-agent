@@ -166,9 +166,13 @@ def run_oneshot(
         return 2
     use_config_toolsets = _normalize_toolsets(toolsets) is None
 
-    # Auto-approve any shell / tool approvals.  Non-interactive by
-    # definition — a prompt would hang forever.
-    os.environ["HERMES_YOLO_MODE"] = "1"
+    # Auto-approve any shell / tool approvals by default.  Non-interactive by
+    # definition -- a prompt would hang forever. Callers that need a safer
+    # fail-closed worker (for example realtime voice background sessions) can
+    # set HERMES_ONESHOT_DISABLE_YOLO=1.
+    disable_yolo = os.getenv("HERMES_ONESHOT_DISABLE_YOLO", "").strip().lower()
+    if disable_yolo not in {"1", "true", "yes", "on"}:
+        os.environ["HERMES_YOLO_MODE"] = "1"
     os.environ["HERMES_ACCEPT_HOOKS"] = "1"
 
     # Redirect stderr AND stdout to devnull for the entire call tree.
@@ -332,6 +336,9 @@ def _run_agent(
     # honour the same merge semantics as interactive CLI and gateway sessions.
     _fb = get_fallback_chain(cfg)
 
+    session_id = os.getenv("HERMES_ONESHOT_SESSION_ID", "").strip() or None
+    session_source = os.getenv("HERMES_SESSION_SOURCE", "").strip() or "cli"
+
     agent = AIAgent(
         api_key=runtime.get("api_key"),
         base_url=runtime.get("base_url"),
@@ -340,7 +347,8 @@ def _run_agent(
         model=effective_model,
         enabled_toolsets=toolsets_list,
         quiet_mode=True,
-        platform="cli",
+        platform=session_source,
+        session_id=session_id,
         session_db=session_db,
         credential_pool=runtime.get("credential_pool"),
         fallback_model=_fb or None,
