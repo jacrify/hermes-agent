@@ -178,6 +178,7 @@ def test_default_realtime_session_config_uses_chat_agent_prompt_plus_voice_adden
     session = web_server._default_realtime_session_config(agent=FakeRealtimeAgent())
 
     assert session["type"] == "realtime"
+    assert session["model"] == "gpt-realtime-2"
     assert session["tools"] == [FAKE_REALTIME_TOOL_DEF]
     assert "CHAT PROMPT FROM AIAGENT" in session["instructions"]
     assert "CHAT OVERLAY" in session["instructions"]
@@ -607,6 +608,85 @@ def test_realtime_sideband_shadows_transcript_and_tools_to_session_db(monkeypatc
     assert rows[2]["tool_calls"][0]["function"]["name"] == "delegate_task"
     assert rows[3]["tool_name"] == "delegate_task"
     assert rows[3]["content"] == '{"result":"done"}'
+
+
+def test_realtime_browser_transcript_event_endpoint_shadows_to_session_db(client):
+    rows: list[dict] = []
+
+    class FakeDB:
+        def append_message(self, session_id, role, **kwargs):
+            rows.append({"session_id": session_id, "role": role, **kwargs})
+            return len(rows)
+
+    agent = FakeRealtimeAgent()
+    agent._session_db = FakeDB()
+    session = web_server.RealtimeVoiceAgentSession(
+        call_id="rtc_browser",
+        agent=agent,
+        api_key="sk-test",
+        cwd="/tmp/workspace",
+        enabled_toolsets=agent.enabled_toolsets,
+        shadowed_item_ids=set(),
+        assistant_buffers={},
+    )
+    with web_server._realtime_voice_sessions_lock:
+        web_server._realtime_voice_sessions["rtc_browser"] = session
+
+    try:
+        response = client.post(
+            "/api/realtime/voice/transcript-event",
+            headers=_json_auth_headers(),
+            json={
+                "call_id": "rtc_browser",
+                "event": {
+                    "type": "conversation.item.input_audio_transcription.completed",
+                    "item_id": "user_browser_1",
+                    "transcript": "how many siblings do I have",
+                },
+            },
+        )
+        assert response.status_code == 200
+        assert response.json()["shadowed"] is True
+
+        response = client.post(
+            "/api/realtime/voice/transcript-event",
+            headers=_json_auth_headers(),
+            json={
+                "call_id": "rtc_browser",
+                "event": {
+                    "type": "response.audio_transcript.delta",
+                    "response_id": "resp_browser_1",
+                    "delta": "Four brothers",
+                },
+            },
+        )
+        assert response.status_code == 200
+        response = client.post(
+            "/api/realtime/voice/transcript-event",
+            headers=_json_auth_headers(),
+            json={
+                "call_id": "rtc_browser",
+                "event": {
+                    "type": "response.audio_transcript.delta",
+                    "response_id": "resp_browser_1",
+                    "delta": " and four sisters.",
+                },
+            },
+        )
+        assert response.status_code == 200
+        response = client.post(
+            "/api/realtime/voice/transcript-event",
+            headers=_json_auth_headers(),
+            json={"call_id": "rtc_browser", "event": {"type": "response.done"}},
+        )
+        assert response.status_code == 200
+    finally:
+        with web_server._realtime_voice_sessions_lock:
+            web_server._realtime_voice_sessions.pop("rtc_browser", None)
+
+    assert [row["role"] for row in rows] == ["user", "assistant"]
+    assert rows[0]["content"] == "how many siblings do I have"
+    assert rows[1]["content"] == "Four brothers and four sisters."
 
 
 def test_realtime_voice_tool_endpoint_wraps_unexpected_failures(client, monkeypatch):

@@ -216,6 +216,7 @@ _DESKTOP_UPLOAD_IMAGE_MAX_BYTES = 25 * 1024 * 1024
 _REALTIME_SDP_MAX_BYTES = 512 * 1024
 _OPENAI_REALTIME_CALLS_URL = "https://api.openai.com/v1/realtime/calls"
 _OPENAI_REALTIME_SIDEBAND_URL = "wss://api.openai.com/v1/realtime"
+_DEFAULT_REALTIME_MODEL = "gpt-realtime-2"
 _REALTIME_UNSUPPORTED_AGENT_LOOP_TOOLS = {
     "delegate_task",
     "memory",
@@ -706,6 +707,11 @@ class RealtimeToolCallRequest(BaseModel):
     arguments: Dict[str, Any] = {}
     call_id: Optional[str] = None
     item_id: Optional[str] = None
+
+
+class RealtimeTranscriptEventRequest(BaseModel):
+    call_id: str
+    event: Dict[str, Any]
 
 
 class ModelAssignment(BaseModel):
@@ -1910,7 +1916,7 @@ def _default_realtime_session_config(*, agent: Any = None) -> Dict[str, Any]:
     model = (
         os.environ.get("HERMES_REALTIME_MODEL", "").strip()
         or str(realtime_cfg.get("model", "") or "").strip()
-        or "gpt-realtime"
+        or _DEFAULT_REALTIME_MODEL
     )
     voice = (
         os.environ.get("HERMES_REALTIME_VOICE", "").strip()
@@ -2788,6 +2794,35 @@ async def execute_realtime_voice_tool(body: RealtimeToolCallRequest):
         "call_id": call_id,
         "output": result,
     }
+
+
+@app.post("/api/realtime/voice/transcript-event")
+async def shadow_realtime_voice_transcript_event(body: RealtimeTranscriptEventRequest):
+    """Persist browser-observed Realtime transcript events into the voice session."""
+    call_id = _normalize_realtime_call_id(body.call_id)
+    if not call_id:
+        raise HTTPException(status_code=400, detail="Realtime call id is required")
+    event = body.event if isinstance(body.event, dict) else {}
+    event_type = str(event.get("type") or "")
+    allowed = {
+        "conversation.item.input_audio_transcription.completed",
+        "conversation.item.created",
+        "response.audio_transcript.delta",
+        "response.audio_transcript.done",
+        "response.text.delta",
+        "response.text.done",
+        "response.output_text.delta",
+        "response.output_text.done",
+        "response.done",
+    }
+    if event_type not in allowed:
+        return {"ok": True, "shadowed": False}
+    with _realtime_voice_sessions_lock:
+        session = _realtime_voice_sessions.get(call_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="Realtime voice session not found")
+    _shadow_realtime_event(session, event)
+    return {"ok": True, "shadowed": True}
 
 
 class TTSSpeakRequest(BaseModel):

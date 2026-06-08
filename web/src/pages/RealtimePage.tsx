@@ -39,6 +39,7 @@ interface RealtimeFunctionCallItem {
 
 const SDP_ENDPOINT = "/api/realtime/voice/sdp";
 const TOOL_ENDPOINT = "/api/realtime/voice/tool";
+const TRANSCRIPT_EVENT_ENDPOINT = "/api/realtime/voice/transcript-event";
 const MAX_EVENTS = 18;
 
 function autoStartRequested(pathname: string, search: string): boolean {
@@ -144,6 +145,20 @@ function contentText(item: unknown): string | null {
   return parts.length ? parts.join("\n") : null;
 }
 
+function shouldShadowRealtimeTranscriptEvent(type: unknown): boolean {
+  return (
+    type === "conversation.item.input_audio_transcription.completed" ||
+    type === "conversation.item.created" ||
+    type === "response.audio_transcript.delta" ||
+    type === "response.audio_transcript.done" ||
+    type === "response.text.delta" ||
+    type === "response.text.done" ||
+    type === "response.output_text.delta" ||
+    type === "response.output_text.done" ||
+    type === "response.done"
+  );
+}
+
 function toolContext(name: string, args: Record<string, unknown>): string {
   const entries = Object.entries(args);
   if (!entries.length) return name;
@@ -182,6 +197,7 @@ export default function RealtimePage() {
   const pendingFunctionCallsRef = useRef<Map<string, RealtimeFunctionCallItem>>(new Map());
   const functionArgumentBuffersRef = useRef<Map<string, string>>(new Map());
   const sidebandToolsRef = useRef(false);
+  const callIdRef = useRef<string | null>(null);
   const micMutedRef = useRef(micMuted);
   const speakerMutedRef = useRef(speakerMuted);
 
@@ -254,6 +270,7 @@ export default function RealtimePage() {
     pendingFunctionCallsRef.current.clear();
     functionArgumentBuffersRef.current.clear();
     sidebandToolsRef.current = false;
+    callIdRef.current = null;
 
     const pc = pcRef.current;
     if (pc) {
@@ -395,10 +412,21 @@ export default function RealtimePage() {
     }
   }, [updateTool]);
 
+  const shadowRealtimeTranscriptEvent = useCallback((event: Record<string, unknown>) => {
+    const callId = callIdRef.current;
+    if (!callId || !shouldShadowRealtimeTranscriptEvent(event.type)) return;
+    void authedFetch(TRANSCRIPT_EVENT_ENDPOINT, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ call_id: callId, event }),
+    }).catch(() => undefined);
+  }, []);
+
   const handleRealtimeMessage = useCallback((message: MessageEvent<string>) => {
     const event = parseRealtimeMessage(message);
     pushEvent(eventType(event));
     if (!event) return;
+    shadowRealtimeTranscriptEvent(event);
 
     const type = event.type;
     const functionCall = functionCallFromRealtimeEvent(event);
@@ -511,7 +539,7 @@ export default function RealtimePage() {
         addTranscript(role, textValue, stringFromEvent((item as { id?: unknown }).id) ?? undefined);
       }
     }
-  }, [addTranscript, appendTranscript, executeRealtimeToolCall, pushEvent]);
+  }, [addTranscript, appendTranscript, executeRealtimeToolCall, pushEvent, shadowRealtimeTranscriptEvent]);
 
   const start = useCallback(async () => {
     if (startInFlightRef.current || state === "connecting" || state === "live") return;
@@ -613,6 +641,7 @@ export default function RealtimePage() {
         throw new Error(`${response.status}: ${body || response.statusText}`);
       }
       sidebandToolsRef.current = response.headers.get("X-Hermes-Realtime-Sideband") === "1";
+      callIdRef.current = response.headers.get("X-Hermes-Realtime-Call");
       pushEvent(sidebandToolsRef.current ? "sideband.tools" : "browser.tools");
       const answerSdp = await response.text();
       if (!isCurrentRun()) return;
