@@ -224,7 +224,6 @@ _REALTIME_UNSUPPORTED_AGENT_LOOP_TOOLS = {
     "todo",
 }
 _REALTIME_TOOL_RESULT_MAX_CHARS = 12000
-_REALTIME_VOICE_MAX_TOOL_CALLS_DEFAULT = 16
 _REALTIME_VOICE_ADDENDUM = (
     "Realtime voice transport addendum: this is a spoken realtime session. "
     "Keep spoken replies brief, natural, and interruption-friendly. "
@@ -240,10 +239,7 @@ _REALTIME_VOICE_ADDENDUM = (
     "subagents, or tool mechanics to John for quick work; just wait for the "
     "result and answer naturally. If work may take noticeably long, say you "
     "need a moment to check or work through it, without mentioning subagents "
-    "or background execution unless John explicitly asks how it works. Avoid "
-    "tool loops: once you have enough evidence, or if repeated searches are "
-    "not improving the answer, stop calling tools and answer from the results "
-    "you already have."
+    "or background execution unless John explicitly asks how it works."
 )
 
 
@@ -259,8 +255,6 @@ class RealtimeVoiceAgentSession:
     last_event_at: float = 0.0
     shadowed_item_ids: Optional[set[str]] = None
     assistant_buffers: Optional[Dict[str, str]] = None
-    tool_call_count: int = 0
-    max_tool_calls: int = _REALTIME_VOICE_MAX_TOOL_CALLS_DEFAULT
 
 
 _realtime_voice_sessions: Dict[str, RealtimeVoiceAgentSession] = {}
@@ -1794,26 +1788,6 @@ def _realtime_max_turns(config: Optional[Dict[str, Any]] = None, default: int = 
     return default
 
 
-def _realtime_voice_max_tool_calls(config: Optional[Dict[str, Any]] = None) -> int:
-    cfg = config if isinstance(config, dict) else load_config()
-    try:
-        env_value = int(os.environ.get("HERMES_REALTIME_MAX_TOOL_CALLS", "") or 0)
-        if env_value > 0:
-            return env_value
-    except (TypeError, ValueError):
-        pass
-    if isinstance(cfg, dict):
-        realtime_cfg = cfg.get("realtime") or {}
-        if isinstance(realtime_cfg, dict):
-            try:
-                value = int(realtime_cfg.get("max_tool_calls") or 0)
-                if value > 0:
-                    return value
-            except (TypeError, ValueError):
-                pass
-    return _REALTIME_VOICE_MAX_TOOL_CALLS_DEFAULT
-
-
 _realtime_session_db = None
 _realtime_session_db_error = ""
 
@@ -2374,37 +2348,13 @@ async def _handle_realtime_sideband_function_call(
         call_id=call_id,
         raw_arguments=raw_arguments or "{}",
     )
-    session.tool_call_count += 1
-    if session.tool_call_count > max(1, session.max_tool_calls):
-        _log.warning(
-            "Realtime voice sideband tool budget exhausted name=%s call_id=%s session=%s count=%d max=%d",
-            name,
-            call_id,
-            session.call_id,
-            session.tool_call_count,
-            session.max_tool_calls,
-        )
-        output = json.dumps(
-            {
-                "status": "tool_budget_exhausted",
-                "message": (
-                    "Hermes voice has already made enough tool calls for this turn. "
-                    "Do not call another tool. Answer John now using the tool results "
-                    "already available, and be explicit about any uncertainty."
-                ),
-                "tool_call_count": session.tool_call_count,
-                "max_tool_calls": session.max_tool_calls,
-            },
-            ensure_ascii=False,
-        )
-    else:
-        output = await asyncio.to_thread(
-            _execute_realtime_agent_tool_call,
-            session=session,
-            name=name,
-            arguments=parsed_args,
-            call_id=call_id,
-        )
+    output = await asyncio.to_thread(
+        _execute_realtime_agent_tool_call,
+        session=session,
+        name=name,
+        arguments=parsed_args,
+        call_id=call_id,
+    )
     _shadow_realtime_tool_output(session, name=name, call_id=call_id, output=output)
     await _send_realtime_sideband_event(
         ws,
@@ -2418,12 +2368,10 @@ async def _handle_realtime_sideband_function_call(
         },
     )
     _log.info(
-        "Realtime voice sideband function output posted name=%s call_id=%s session=%s count=%d max=%d",
+        "Realtime voice sideband function output posted name=%s call_id=%s session=%s",
         name,
         call_id,
         session.call_id,
-        session.tool_call_count,
-        session.max_tool_calls,
     )
     await _send_realtime_sideband_event(ws, {"type": "response.create"})
     _log.info(
@@ -2579,19 +2527,17 @@ def _start_realtime_voice_sideband(
         last_event_at=time.time(),
         shadowed_item_ids=set(),
         assistant_buffers={},
-        max_tool_calls=_realtime_voice_max_tool_calls(config),
     )
     task = asyncio.create_task(_realtime_sideband_loop(realtime_session))
     realtime_session.sideband_task = task
     with _realtime_voice_sessions_lock:
         _realtime_voice_sessions[call_id] = realtime_session
     _log.info(
-        "Realtime voice sideband session started call_id=%s hermes_session_id=%s tools=%d cwd=%s max_tool_calls=%d",
+        "Realtime voice sideband session started call_id=%s hermes_session_id=%s tools=%d cwd=%s",
         call_id,
         safe_session_id,
         len(getattr(agent, "tools", []) or []),
         realtime_session.cwd or "<unset>",
-        realtime_session.max_tool_calls,
     )
     return realtime_session
 
