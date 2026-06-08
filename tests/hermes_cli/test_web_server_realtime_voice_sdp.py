@@ -182,6 +182,8 @@ def test_default_realtime_session_config_uses_chat_agent_prompt_plus_voice_adden
     assert "CHAT PROMPT FROM AIAGENT" in session["instructions"]
     assert "CHAT OVERLAY" in session["instructions"]
     assert "spoken realtime session" in session["instructions"]
+    assert "delegate_task is synchronous" in session["instructions"]
+    assert "do not say it is running in the background" in session["instructions"]
 
 
 def test_realtime_tool_definitions_flatten_chat_completion_tool_shape(monkeypatch):

@@ -234,7 +234,10 @@ _REALTIME_VOICE_ADDENDUM = (
     "debugging, planning, or anything where your realtime model may be shallow, "
     "prefer using delegate_task with the same relevant context and inherited "
     "toolset. Use subagents often, especially when a GPT-5.5 child can think "
-    "more carefully than the live voice model."
+    "more carefully than the live voice model. delegate_task is synchronous "
+    "for this voice session: do not say it is running in the background or "
+    "that you will come back later. Say that you are asking a subagent now, "
+    "then wait for the tool result and answer from it."
 )
 
 
