@@ -2254,7 +2254,16 @@ async def _realtime_sideband_loop(session: RealtimeVoiceAgentSession) -> None:
     except asyncio.CancelledError:
         raise
     except Exception:
-        _log.exception("Realtime voice sideband loop failed call_id=%s", session.call_id)
+        try:
+            import websockets
+
+            closed_exc = getattr(websockets.exceptions, "ConnectionClosed", ())
+        except Exception:
+            closed_exc = ()
+        if closed_exc and isinstance(sys.exc_info()[1], closed_exc):
+            _log.info("Realtime voice sideband connection closed call_id=%s", session.call_id)
+        else:
+            _log.exception("Realtime voice sideband loop failed call_id=%s", session.call_id)
     finally:
         _log.info("Realtime voice sideband disconnected call_id=%s", session.call_id)
 
