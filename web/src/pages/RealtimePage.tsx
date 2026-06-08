@@ -107,6 +107,13 @@ function functionCallFromRealtimeEvent(
   return null;
 }
 
+function realtimeFunctionCallKeys(item: RealtimeFunctionCallItem): string[] {
+  return [item.call_id, item.id].filter(
+    (value, index, values): value is string =>
+      typeof value === "string" && value.trim() !== "" && values.indexOf(value) === index,
+  );
+}
+
 function parseFunctionArguments(raw: string | undefined): Record<string, unknown> {
   if (!raw) return {};
   try {
@@ -171,6 +178,9 @@ export default function RealtimePage() {
   const startInFlightRef = useRef(false);
   const autoStartAttemptedRef = useRef(false);
   const executingToolCallsRef = useRef<Set<string>>(new Set());
+  const completedToolCallsRef = useRef<Set<string>>(new Set());
+  const pendingFunctionCallsRef = useRef<Map<string, RealtimeFunctionCallItem>>(new Map());
+  const functionArgumentBuffersRef = useRef<Map<string, string>>(new Map());
   const micMutedRef = useRef(micMuted);
   const speakerMutedRef = useRef(speakerMuted);
 
@@ -239,6 +249,9 @@ export default function RealtimePage() {
     }
     dataChannelRef.current = null;
     executingToolCallsRef.current.clear();
+    completedToolCallsRef.current.clear();
+    pendingFunctionCallsRef.current.clear();
+    functionArgumentBuffersRef.current.clear();
 
     const pc = pcRef.current;
     if (pc) {
@@ -284,7 +297,12 @@ export default function RealtimePage() {
 
     const callId = item.call_id || item.id || `realtime-${Date.now()}`;
     const dedupeKey = `${callId}:${name}`;
-    if (executingToolCallsRef.current.has(dedupeKey)) return;
+    if (
+      executingToolCallsRef.current.has(dedupeKey) ||
+      completedToolCallsRef.current.has(dedupeKey)
+    ) {
+      return;
+    }
     executingToolCallsRef.current.add(dedupeKey);
 
     const args = parseFunctionArguments(item.arguments);
@@ -370,6 +388,7 @@ export default function RealtimePage() {
         channel.send(JSON.stringify({ type: "response.create" }));
       }
     } finally {
+      completedToolCallsRef.current.add(dedupeKey);
       executingToolCallsRef.current.delete(dedupeKey);
     }
   }, [updateTool]);
@@ -382,7 +401,67 @@ export default function RealtimePage() {
     const type = event.type;
     const functionCall = functionCallFromRealtimeEvent(event);
     if (functionCall) {
-      void executeRealtimeToolCall(functionCall);
+      const keys = realtimeFunctionCallKeys(functionCall);
+      for (const key of keys) {
+        pendingFunctionCallsRef.current.set(key, functionCall);
+        if (functionCall.arguments) {
+          functionArgumentBuffersRef.current.set(key, functionCall.arguments);
+        }
+      }
+
+      if (type === "response.output_item.done") {
+        const bufferedArguments = keys
+          .map((key) => functionArgumentBuffersRef.current.get(key))
+          .find((value): value is string => typeof value === "string");
+        void executeRealtimeToolCall({
+          ...functionCall,
+          arguments: functionCall.arguments ?? bufferedArguments,
+        });
+      }
+      return;
+    }
+
+    if (type === "response.function_call_arguments.delta") {
+      const keys = [
+        stringFromEvent(event.call_id),
+        stringFromEvent(event.item_id),
+      ].filter((value): value is string => !!value);
+      const delta = stringFromEvent(event.delta) ?? "";
+      if (delta) {
+        for (const key of keys) {
+          functionArgumentBuffersRef.current.set(
+            key,
+            `${functionArgumentBuffersRef.current.get(key) ?? ""}${delta}`,
+          );
+        }
+      }
+      return;
+    }
+
+    if (type === "response.function_call_arguments.done") {
+      const keys = [
+        stringFromEvent(event.call_id),
+        stringFromEvent(event.item_id),
+      ].filter((value): value is string => !!value);
+      const pending = keys
+        .map((key) => pendingFunctionCallsRef.current.get(key))
+        .find((item): item is RealtimeFunctionCallItem => !!item);
+      const argumentsText =
+        stringFromEvent(event.arguments) ??
+        keys
+          .map((key) => functionArgumentBuffersRef.current.get(key))
+          .find((value): value is string => typeof value === "string");
+      const name = stringFromEvent(event.name) ?? pending?.name;
+      if (name) {
+        void executeRealtimeToolCall({
+          ...pending,
+          id: pending?.id ?? stringFromEvent(event.item_id) ?? undefined,
+          call_id: stringFromEvent(event.call_id) ?? pending?.call_id,
+          name,
+          type: "function_call",
+          arguments: argumentsText,
+        });
+      }
       return;
     }
 
