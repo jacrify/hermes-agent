@@ -544,6 +544,48 @@ async def test_realtime_sideband_posts_function_output_and_response_create(monke
     ]
 
 
+@pytest.mark.asyncio
+async def test_realtime_sideband_tool_budget_forces_answer_without_running_tool(monkeypatch):
+    sent: list[dict] = []
+    agent = FakeRealtimeAgent()
+    session = web_server.RealtimeVoiceAgentSession(
+        call_id="rtc_budget",
+        agent=agent,
+        api_key="sk-test",
+        cwd="/tmp/workspace",
+        enabled_toolsets=agent.enabled_toolsets,
+        tool_call_count=1,
+        max_tool_calls=1,
+    )
+
+    class FakeWs:
+        async def send(self, payload):
+            sent.append(web_server.json.loads(payload))
+
+    def fail_execute(**_kwargs):
+        raise AssertionError("tool should not run after realtime voice budget is exhausted")
+
+    monkeypatch.setattr(web_server, "_execute_realtime_agent_tool_call", fail_execute)
+
+    await web_server._handle_realtime_sideband_function_call(
+        session,
+        FakeWs(),
+        {
+            "type": "function_call",
+            "name": "web_search",
+            "call_id": "call_again",
+            "arguments": '{"query":"one more search"}',
+        },
+    )
+
+    assert sent[0]["type"] == "conversation.item.create"
+    assert sent[0]["item"]["type"] == "function_call_output"
+    assert sent[0]["item"]["call_id"] == "call_again"
+    assert "tool_budget_exhausted" in sent[0]["item"]["output"]
+    assert sent[1] == {"type": "response.create"}
+    assert session.tool_call_count == 2
+
+
 def test_realtime_sideband_shadows_transcript_and_tools_to_session_db(monkeypatch):
     rows: list[dict] = []
 
