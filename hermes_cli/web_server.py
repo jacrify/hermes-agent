@@ -23,6 +23,7 @@ import logging
 import os
 import re
 import secrets
+import socket
 import stat
 import subprocess
 import sys
@@ -1802,7 +1803,26 @@ def _execute_realtime_tool_call(
     arguments: Dict[str, Any],
     call_id: str,
 ) -> str:
+    started_at = time.monotonic()
+    terminal_cwd = os.environ.get("TERMINAL_CWD", "")
+    try:
+        process_cwd = os.getcwd()
+    except Exception:
+        process_cwd = "<unavailable>"
+    _log.info(
+        "Realtime voice tool call started name=%s call_id=%s cwd=%s terminal_cwd=%s",
+        name,
+        call_id,
+        process_cwd,
+        terminal_cwd or "<unset>",
+    )
     if name in _REALTIME_UNSUPPORTED_AGENT_LOOP_TOOLS:
+        _log.info(
+            "Realtime voice tool call rejected name=%s call_id=%s reason=unsupported duration_ms=%d",
+            name,
+            call_id,
+            int((time.monotonic() - started_at) * 1000),
+        )
         return json.dumps(
             {
                 "error": (
@@ -1828,6 +1848,13 @@ def _execute_realtime_tool_call(
         available_names = set()
 
     if name not in available_names:
+        _log.warning(
+            "Realtime voice tool call unavailable name=%s call_id=%s available_count=%d duration_ms=%d",
+            name,
+            call_id,
+            len(available_names),
+            int((time.monotonic() - started_at) * 1000),
+        )
         return json.dumps(
             {
                 "error": f"{name} is not available in this realtime voice session.",
@@ -1856,6 +1883,13 @@ def _execute_realtime_tool_call(
         )
     if not isinstance(result, str):
         result = json.dumps(result, ensure_ascii=False, default=str)
+    _log.info(
+        "Realtime voice tool call finished name=%s call_id=%s duration_ms=%d output_chars=%d",
+        name,
+        call_id,
+        int((time.monotonic() - started_at) * 1000),
+        len(result),
+    )
     return _truncate_realtime_tool_output(result)
 
 
@@ -1928,12 +1962,26 @@ async def execute_realtime_voice_tool(body: RealtimeToolCallRequest):
         raise HTTPException(status_code=400, detail="Tool arguments must be an object")
 
     call_id = (body.call_id or body.item_id or f"realtime-{secrets.token_hex(8)}").strip()
-    result = await asyncio.to_thread(
-        _execute_realtime_tool_call,
-        name=name,
-        arguments=body.arguments,
-        call_id=call_id,
-    )
+    try:
+        result = await asyncio.to_thread(
+            _execute_realtime_tool_call,
+            name=name,
+            arguments=body.arguments,
+            call_id=call_id,
+        )
+    except Exception as exc:
+        _log.exception(
+            "Realtime voice tool endpoint failed before tool result name=%s call_id=%s",
+            name,
+            call_id,
+        )
+        result = json.dumps(
+            {
+                "error": f"Realtime voice tool endpoint failed: {exc}",
+                "status": "error",
+            },
+            ensure_ascii=False,
+        )
     return {
         "ok": True,
         "name": name,
@@ -8961,6 +9009,31 @@ def _resolve_chat_argv(
     return list(argv), str(cwd) if cwd else None, env
 
 
+def _dashboard_child_connect_host(bound_host: Optional[str]) -> Optional[str]:
+    """Return a concrete host that server-spawned child processes can dial.
+
+    ``0.0.0.0``/``::`` are valid bind addresses but invalid/fragile client
+    destinations. In hardened self-hosted setups, loopback may also be blocked
+    by local firewall rules, so prefer the routed source address used for
+    outbound traffic. Operators can override this with
+    ``HERMES_DASHBOARD_INTERNAL_HOST`` when a specific interface is required.
+    """
+    override = os.environ.get("HERMES_DASHBOARD_INTERNAL_HOST", "").strip()
+    if override:
+        return override
+
+    host = (bound_host or "").strip()
+    if host and host not in {"0.0.0.0", "::"}:
+        return host
+
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.connect(("1.1.1.1", 80))
+            return str(sock.getsockname()[0])
+    except Exception:
+        return "127.0.0.1"
+
+
 def _build_gateway_ws_url() -> Optional[str]:
     """ws:// URL the PTY child should attach to for JSON-RPC gateway traffic.
 
@@ -8972,7 +9045,7 @@ def _build_gateway_ws_url() -> Optional[str]:
     the child reads this URL once at startup and reuses it on every reconnect,
     and a 30s-TTL ticket can expire before a slow cold boot even dials.
     """
-    host = getattr(app.state, "bound_host", None)
+    host = _dashboard_child_connect_host(getattr(app.state, "bound_host", None))
     port = getattr(app.state, "bound_port", None)
 
     if not host or not port:
@@ -9008,7 +9081,7 @@ def _build_sidecar_url(channel: str) -> Optional[str]:
     Connections authenticated this way are recorded under the
     ``server-internal`` identity in the audit log.
     """
-    host = getattr(app.state, "bound_host", None)
+    host = _dashboard_child_connect_host(getattr(app.state, "bound_host", None))
     port = getattr(app.state, "bound_port", None)
 
     if not host or not port:
@@ -9123,10 +9196,26 @@ async def pty_ws(ws: WebSocket) -> None:
     sidecar_url = _build_sidecar_url(channel) if channel else None
 
     try:
-        argv, cwd, env = _resolve_chat_argv(resume=resume, sidecar_url=sidecar_url)
+        await ws.send_text("\r\n\x1b[90m[starting Hermes chat...]\x1b[0m\r\n")
+        resolve_task = asyncio.create_task(
+            asyncio.to_thread(
+                _resolve_chat_argv,
+                resume=resume,
+                sidecar_url=sidecar_url,
+            )
+        )
+        while not resolve_task.done():
+            await asyncio.sleep(3)
+            if not resolve_task.done():
+                await ws.send_text("\x1b[90m.\x1b[0m")
+        argv, cwd, env = await resolve_task
     except SystemExit as exc:
         # _make_tui_argv calls sys.exit(1) when node/npm is missing.
         await ws.send_text(f"\r\n\x1b[31mChat unavailable: {exc}\x1b[0m\r\n")
+        await ws.close(code=1011)
+        return
+    except Exception as exc:
+        await ws.send_text(f"\r\n\x1b[31mChat failed to prepare: {exc}\x1b[0m\r\n")
         await ws.close(code=1011)
         return
 
