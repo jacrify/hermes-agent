@@ -313,6 +313,48 @@ def test_realtime_tool_execution_uses_scoped_model_tools(monkeypatch):
     assert captured["handle_kwargs"]["enabled_toolsets"] == ["web", "mcp-files"]
 
 
+def test_realtime_tool_execution_bridges_configured_terminal_cwd(monkeypatch, tmp_path):
+    service_cwd = tmp_path / "hermes-agent"
+    workspace_cwd = tmp_path / "workspace"
+    service_cwd.mkdir()
+    workspace_cwd.mkdir()
+    captured: dict[str, object] = {}
+
+    def fake_get_tool_definitions(**_kwargs):
+        return [FAKE_TOOL_DEF]
+
+    def fake_handle_function_call(**kwargs):
+        captured["terminal_cwd"] = web_server.os.environ.get("TERMINAL_CWD")
+        captured["process_cwd"] = web_server.os.getcwd()
+        captured["handle_kwargs"] = kwargs
+        return '{"result": "ok"}'
+
+    fake_model_tools = SimpleNamespace(
+        get_tool_definitions=fake_get_tool_definitions,
+        handle_function_call=fake_handle_function_call,
+    )
+    monkeypatch.setitem(sys.modules, "model_tools", fake_model_tools)
+    monkeypatch.setattr(web_server, "_realtime_enabled_toolsets", lambda: ["web"])
+    monkeypatch.setattr(
+        web_server,
+        "load_config",
+        lambda: {"terminal": {"cwd": str(workspace_cwd)}},
+    )
+    monkeypatch.delenv("TERMINAL_CWD", raising=False)
+    monkeypatch.chdir(service_cwd)
+
+    result = web_server._execute_realtime_tool_call(
+        name="web_search",
+        arguments={"query": "Hermes"},
+        call_id="call_cwd",
+    )
+
+    assert result == '{"result": "ok"}'
+    assert captured["process_cwd"] == str(service_cwd)
+    assert captured["terminal_cwd"] == str(workspace_cwd)
+    assert captured["handle_kwargs"]["function_name"] == "web_search"
+
+
 def test_realtime_tool_execution_logs_cwd_context(monkeypatch, caplog, tmp_path):
     captured: dict[str, object] = {}
 

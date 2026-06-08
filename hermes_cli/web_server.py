@@ -1703,6 +1703,7 @@ def _realtime_voice_instructions(
 
 def _default_realtime_session_config() -> Dict[str, Any]:
     cfg = load_config()
+    _bridge_realtime_terminal_cwd(cfg)
     realtime_cfg = cfg.get("realtime", {})
     if not isinstance(realtime_cfg, dict):
         realtime_cfg = {}
@@ -1797,6 +1798,49 @@ def _truncate_realtime_tool_output(output: str) -> str:
     )
 
 
+def _bridge_realtime_terminal_cwd(config: Optional[Dict[str, Any]] = None) -> str:
+    """Ensure dashboard realtime tools see config.yaml terminal.cwd.
+
+    ``hermes dashboard`` can be launched from the Hermes install directory
+    (systemd WorkingDirectory, desktop backend cwd, etc.). Gateway sessions
+    bridge ``terminal.cwd`` to ``TERMINAL_CWD`` during startup; realtime voice
+    tool calls bypass that gateway bootstrap and call ``model_tools`` directly,
+    so we apply the same cwd carrier here before assembling or executing tools.
+    """
+    cfg = config if isinstance(config, dict) else load_config()
+    terminal_cfg = cfg.get("terminal", {}) if isinstance(cfg, dict) else {}
+    configured = ""
+    if isinstance(terminal_cfg, dict):
+        raw = terminal_cfg.get("cwd")
+        if isinstance(raw, str):
+            configured = raw.strip()
+
+    if configured and configured not in {".", "auto", "cwd"}:
+        expanded = os.path.abspath(os.path.expandvars(os.path.expanduser(configured)))
+        if os.path.isdir(expanded):
+            previous = os.environ.get("TERMINAL_CWD", "")
+            os.environ["TERMINAL_CWD"] = expanded
+            if previous != expanded:
+                _log.info(
+                    "Realtime voice terminal cwd bridged from config cwd=%s previous=%s",
+                    expanded,
+                    previous or "<unset>",
+                )
+            return expanded
+        _log.warning(
+            "Realtime voice terminal cwd from config does not exist: %s",
+            expanded,
+        )
+
+    terminal_cwd = os.environ.get("TERMINAL_CWD", "").strip()
+    if terminal_cwd:
+        return terminal_cwd
+    try:
+        return os.getcwd()
+    except Exception:
+        return ""
+
+
 def _execute_realtime_tool_call(
     *,
     name: str,
@@ -1804,7 +1848,7 @@ def _execute_realtime_tool_call(
     call_id: str,
 ) -> str:
     started_at = time.monotonic()
-    terminal_cwd = os.environ.get("TERMINAL_CWD", "")
+    terminal_cwd = _bridge_realtime_terminal_cwd()
     try:
         process_cwd = os.getcwd()
     except Exception:
