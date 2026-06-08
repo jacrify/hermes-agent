@@ -13,6 +13,7 @@ import {
   VolumeX,
 } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
+import { useLocation } from "react-router-dom";
 
 import { ToolCall, type ToolEntry } from "@/components/ToolCall";
 import { authedFetch } from "@/lib/api";
@@ -39,6 +40,15 @@ interface RealtimeFunctionCallItem {
 const SDP_ENDPOINT = "/api/realtime/voice/sdp";
 const TOOL_ENDPOINT = "/api/realtime/voice/tool";
 const MAX_EVENTS = 18;
+
+function autoStartRequested(pathname: string, search: string): boolean {
+  const normalizedPath = pathname.replace(/\/$/, "") || "/";
+  if (normalizedPath === "/voice") return true;
+
+  const params = new URLSearchParams(search);
+  const value = params.get("start") ?? params.get("autostart");
+  return value === "1" || value === "true" || value === "yes";
+}
 
 function voicePrerequisiteError(): string | null {
   if (typeof window === "undefined" || typeof navigator === "undefined") {
@@ -138,6 +148,8 @@ function toolContext(name: string, args: Record<string, unknown>): string {
 }
 
 export default function RealtimePage() {
+  const location = useLocation();
+  const shouldAutoStart = autoStartRequested(location.pathname, location.search);
   const [state, setState] = useState<RealtimeState>("idle");
   const [prerequisiteError, setPrerequisiteError] = useState<string | null>(() =>
     voicePrerequisiteError(),
@@ -157,6 +169,7 @@ export default function RealtimePage() {
   const remoteStreamRef = useRef<MediaStream | null>(null);
   const runIdRef = useRef(0);
   const startInFlightRef = useRef(false);
+  const autoStartAttemptedRef = useRef(false);
   const executingToolCallsRef = useRef<Set<string>>(new Set());
   const micMutedRef = useRef(micMuted);
   const speakerMutedRef = useRef(speakerMuted);
@@ -527,6 +540,7 @@ export default function RealtimePage() {
 
   const resetSession = useCallback(() => {
     stop();
+    autoStartAttemptedRef.current = false;
     setTranscript([]);
     setTools([]);
     setEvents([]);
@@ -554,6 +568,13 @@ export default function RealtimePage() {
     channel.send(JSON.stringify({ type: "response.create" }));
     setText("");
   }, [addTranscript, text]);
+
+  useEffect(() => {
+    if (!shouldAutoStart || autoStartAttemptedRef.current) return;
+    autoStartAttemptedRef.current = true;
+    pushEvent("shortcut.autostart");
+    void start();
+  }, [pushEvent, shouldAutoStart, start]);
 
   useEffect(() => teardown, [teardown]);
 

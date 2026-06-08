@@ -141,6 +141,7 @@ const BUILTIN_ROUTES_CORE: Record<string, ComponentType> = {
   "/pairing": PairingPage,
   "/channels": ChannelsPage,
   "/realtime": RealtimePage,
+  "/voice": RealtimePage,
   "/webhooks": WebhooksPage,
   "/system": SystemPage,
   "/profiles": ProfilesPage,

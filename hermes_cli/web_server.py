@@ -1600,6 +1600,39 @@ def _realtime_enabled_toolsets(config: Optional[Dict[str, Any]] = None) -> List[
         return []
 
 
+def _tool_name_from_definition(tool_def: Dict[str, Any]) -> str:
+    name = tool_def.get("name")
+    if isinstance(name, str) and name.strip():
+        return name.strip()
+    function = tool_def.get("function")
+    if isinstance(function, dict):
+        name = function.get("name")
+        if isinstance(name, str) and name.strip():
+            return name.strip()
+    return ""
+
+
+def _realtime_tool_definition(tool_def: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Convert Hermes chat-completion tool defs to Realtime call tool defs."""
+    name = _tool_name_from_definition(tool_def)
+    if not name:
+        return None
+
+    function = tool_def.get("function")
+    source = function if isinstance(function, dict) else tool_def
+    realtime_tool: Dict[str, Any] = {"type": "function", "name": name}
+
+    description = source.get("description")
+    if isinstance(description, str) and description.strip():
+        realtime_tool["description"] = description
+
+    parameters = source.get("parameters")
+    if isinstance(parameters, dict):
+        realtime_tool["parameters"] = parameters
+
+    return realtime_tool
+
+
 def _realtime_tool_definitions(
     *,
     config: Optional[Dict[str, Any]] = None,
@@ -1626,11 +1659,13 @@ def _realtime_tool_definitions(
     filtered: List[Dict[str, Any]] = []
     skipped: List[str] = []
     for tool_def in tool_defs or []:
-        name = str((tool_def.get("function") or {}).get("name") or "")
+        name = _tool_name_from_definition(tool_def)
         if name in _REALTIME_UNSUPPORTED_AGENT_LOOP_TOOLS:
             skipped.append(name)
             continue
-        filtered.append(tool_def)
+        realtime_tool = _realtime_tool_definition(tool_def)
+        if realtime_tool:
+            filtered.append(realtime_tool)
     return filtered, enabled_toolsets, sorted(skipped)
 
 
@@ -1787,10 +1822,7 @@ def _execute_realtime_tool_call(
             enabled_toolsets=enabled_toolsets,
             quiet_mode=True,
         )
-        available_names = {
-            str((tool_def.get("function") or {}).get("name") or "")
-            for tool_def in available_defs
-        }
+        available_names = {_tool_name_from_definition(tool_def) for tool_def in available_defs}
     except Exception:
         _log.exception("Realtime voice tool availability check failed")
         available_names = set()

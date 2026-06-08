@@ -15,6 +15,7 @@ class DashboardRealtimeRouteSplitTest(unittest.TestCase):
         self.assertIn('import RealtimePage from "@/pages/RealtimePage";', app)
         self.assertIn('path: "/realtime"', app)
         self.assertIn('"/realtime": RealtimePage', app)
+        self.assertIn('"/voice": RealtimePage', app)
 
     def test_chat_page_does_not_mount_realtime_voice_ui(self) -> None:
         chat_page = (ROOT / "web/src/pages/ChatPage.tsx").read_text()
@@ -27,6 +28,8 @@ class DashboardRealtimeRouteSplitTest(unittest.TestCase):
         self.assertIn("resetSession", realtime_page)
         self.assertIn("setMicMuted", realtime_page)
         self.assertIn("setSpeakerMuted", realtime_page)
+        self.assertIn("autoStartRequested", realtime_page)
+        self.assertIn("shortcut.autostart", realtime_page)
 
 
 if __name__ == "__main__":

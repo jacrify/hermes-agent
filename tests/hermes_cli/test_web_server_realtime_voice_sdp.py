@@ -42,6 +42,16 @@ FAKE_TOOL_DEF = {
         },
     },
 }
+FAKE_REALTIME_TOOL_DEF = {
+    "type": "function",
+    "name": "web_search",
+    "description": "Search the web",
+    "parameters": {
+        "type": "object",
+        "properties": {"query": {"type": "string"}},
+        "required": ["query"],
+    },
+}
 
 
 @pytest.fixture
@@ -141,8 +151,29 @@ def test_realtime_voice_sdp_accepts_sdp_and_returns_answer_text(
     assert captured["session"]["type"] == "realtime"
     assert captured["session"]["audio"]["output"]["voice"] == "marin"
     assert captured["session"]["tool_choice"] == "auto"
-    assert captured["session"]["tools"] == [FAKE_TOOL_DEF]
+    assert captured["session"]["tools"] == [FAKE_REALTIME_TOOL_DEF]
     assert "memory" in captured["session"]["instructions"]
+
+
+def test_realtime_tool_definitions_flatten_chat_completion_tool_shape(monkeypatch):
+    monkeypatch.setattr(web_server, "_realtime_enabled_toolsets", lambda config=None: ["web"])
+    monkeypatch.setattr(
+        web_server,
+        "wait_for_mcp_discovery",
+        lambda timeout: None,
+        raising=False,
+    )
+
+    fake_model_tools = SimpleNamespace(
+        get_tool_definitions=lambda **_kwargs: [FAKE_TOOL_DEF],
+    )
+    monkeypatch.setitem(sys.modules, "model_tools", fake_model_tools)
+
+    tools, enabled_toolsets, skipped_tools = web_server._realtime_tool_definitions()
+
+    assert tools == [FAKE_REALTIME_TOOL_DEF]
+    assert enabled_toolsets == ["web"]
+    assert skipped_tools == []
 
 
 def test_openai_realtime_call_uses_ga_multipart_shape(monkeypatch):
