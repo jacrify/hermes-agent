@@ -230,7 +230,11 @@ _REALTIME_VOICE_ADDENDUM = (
     "Ask John for explicit spoken confirmation before destructive actions, "
     "external sends, purchases, deletes, broad file rewrites, or credential "
     "changes. If a tool result is long, summarize the useful part and offer "
-    "to continue."
+    "to continue. For non-trivial questions, research, code reasoning, "
+    "debugging, planning, or anything where your realtime model may be shallow, "
+    "prefer using delegate_task with the same relevant context and inherited "
+    "toolset. Use subagents often, especially when a GPT-5.5 child can think "
+    "more carefully than the live voice model."
 )
 
 
@@ -244,6 +248,8 @@ class RealtimeVoiceAgentSession:
     sideband_task: Optional[asyncio.Task] = None
     created_at: float = 0.0
     last_event_at: float = 0.0
+    shadowed_item_ids: Optional[set[str]] = None
+    assistant_buffers: Optional[Dict[str, str]] = None
 
 
 _realtime_voice_sessions: Dict[str, RealtimeVoiceAgentSession] = {}
@@ -1828,7 +1834,7 @@ def _create_realtime_voice_agent(
             reasoning_config=_realtime_reasoning_config(cfg),
             service_tier=_realtime_service_tier(cfg),
             enabled_toolsets=enabled_toolsets,
-            platform="tui",
+            platform="voice",
             session_id=session_id,
             session_db=_get_realtime_session_db(),
             ephemeral_system_prompt=ephemeral_system_prompt or None,
@@ -2051,6 +2057,196 @@ def _realtime_function_call_items(event: Dict[str, Any]) -> List[Dict[str, Any]]
     return items
 
 
+def _realtime_content_text(item: Any) -> str:
+    if not isinstance(item, dict):
+        return ""
+    content = item.get("content")
+    if not isinstance(content, list):
+        return ""
+    parts: List[str] = []
+    for part in content:
+        if not isinstance(part, dict):
+            continue
+        text = part.get("text")
+        if not isinstance(text, str) or not text.strip():
+            text = part.get("transcript")
+        if isinstance(text, str) and text.strip():
+            parts.append(text.strip())
+    return "\n".join(parts)
+
+
+def _shadow_realtime_message(
+    session: RealtimeVoiceAgentSession,
+    *,
+    role: str,
+    content: str = "",
+    item_id: Optional[str] = None,
+    tool_name: Optional[str] = None,
+    tool_calls: Any = None,
+    tool_call_id: Optional[str] = None,
+    finish_reason: Optional[str] = None,
+) -> None:
+    agent = session.agent
+    db = getattr(agent, "_session_db", None)
+    if db is None:
+        return
+    try:
+        if hasattr(agent, "_ensure_db_session"):
+            agent._ensure_db_session()
+        db.append_message(
+            getattr(agent, "session_id", "") or f"realtime-voice-{session.call_id}",
+            role,
+            content=content,
+            tool_name=tool_name,
+            tool_calls=tool_calls,
+            tool_call_id=tool_call_id,
+            finish_reason=finish_reason,
+            platform_message_id=item_id,
+            observed=True,
+        )
+    except Exception:
+        _log.debug("Realtime voice transcript shadow append failed", exc_info=True)
+
+
+def _shadow_realtime_item(
+    session: RealtimeVoiceAgentSession,
+    item: Any,
+    *,
+    fallback_role: Optional[str] = None,
+) -> None:
+    if not isinstance(item, dict):
+        return
+    item_id = item.get("id")
+    item_id = item_id if isinstance(item_id, str) and item_id else None
+    if item_id and session.shadowed_item_ids is not None and item_id in session.shadowed_item_ids:
+        return
+    role = item.get("role") if isinstance(item.get("role"), str) else fallback_role
+    if role not in {"user", "assistant"}:
+        return
+    text = _realtime_content_text(item)
+    if not text:
+        return
+    _shadow_realtime_message(session, role=role, content=text, item_id=item_id)
+    if item_id and session.shadowed_item_ids is not None:
+        session.shadowed_item_ids.add(item_id)
+
+
+def _shadow_realtime_transcription(session: RealtimeVoiceAgentSession, event: Dict[str, Any]) -> None:
+    item_id = event.get("item_id") if isinstance(event.get("item_id"), str) else None
+    if item_id and session.shadowed_item_ids is not None and item_id in session.shadowed_item_ids:
+        return
+    transcript = event.get("transcript")
+    if not isinstance(transcript, str) or not transcript.strip():
+        return
+    _shadow_realtime_message(session, role="user", content=transcript.strip(), item_id=item_id)
+    if item_id and session.shadowed_item_ids is not None:
+        session.shadowed_item_ids.add(item_id)
+
+
+def _assistant_buffer_key(event: Dict[str, Any]) -> str:
+    for key in ("response_id", "item_id", "output_index"):
+        value = event.get(key)
+        if isinstance(value, str) and value:
+            return value
+        if isinstance(value, int):
+            return str(value)
+    return "assistant-live"
+
+
+def _shadow_realtime_assistant_delta(session: RealtimeVoiceAgentSession, event: Dict[str, Any]) -> None:
+    delta = event.get("delta")
+    if not isinstance(delta, str) or not delta:
+        delta = event.get("text")
+    if not isinstance(delta, str) or not delta:
+        delta = event.get("transcript")
+    if not isinstance(delta, str) or not delta:
+        return
+    if session.assistant_buffers is None:
+        session.assistant_buffers = {}
+    key = _assistant_buffer_key(event)
+    session.assistant_buffers[key] = session.assistant_buffers.get(key, "") + delta
+
+
+def _flush_realtime_assistant_buffers(session: RealtimeVoiceAgentSession) -> None:
+    buffers = session.assistant_buffers or {}
+    for key, text in list(buffers.items()):
+        if isinstance(text, str) and text.strip():
+            _shadow_realtime_message(
+                session,
+                role="assistant",
+                content=text.strip(),
+                item_id=f"assistant-{key}",
+                finish_reason="stop",
+            )
+    buffers.clear()
+
+
+def _shadow_realtime_tool_call(
+    session: RealtimeVoiceAgentSession,
+    *,
+    name: str,
+    call_id: str,
+    raw_arguments: str,
+) -> None:
+    tool_calls = [
+        {
+            "id": call_id,
+            "type": "function",
+            "function": {
+                "name": name,
+                "arguments": raw_arguments or "{}",
+            },
+        }
+    ]
+    _shadow_realtime_message(
+        session,
+        role="assistant",
+        content="",
+        tool_calls=tool_calls,
+        tool_call_id=call_id,
+    )
+
+
+def _shadow_realtime_tool_output(
+    session: RealtimeVoiceAgentSession,
+    *,
+    name: str,
+    call_id: str,
+    output: str,
+) -> None:
+    _shadow_realtime_message(
+        session,
+        role="tool",
+        content=output,
+        tool_name=name,
+        tool_call_id=call_id,
+    )
+
+
+def _shadow_realtime_event(session: RealtimeVoiceAgentSession, event: Dict[str, Any]) -> None:
+    event_type = str(event.get("type") or "")
+    if event_type == "conversation.item.input_audio_transcription.completed":
+        _shadow_realtime_transcription(session, event)
+        return
+    if event_type == "conversation.item.created":
+        _shadow_realtime_item(session, event.get("item"))
+        return
+    if event_type in {
+        "response.audio_transcript.delta",
+        "response.text.delta",
+        "response.output_text.delta",
+    }:
+        _shadow_realtime_assistant_delta(session, event)
+        return
+    if event_type in {
+        "response.audio_transcript.done",
+        "response.text.done",
+        "response.output_text.done",
+        "response.done",
+    }:
+        _flush_realtime_assistant_buffers(session)
+
+
 def _execute_realtime_agent_tool_call(
     *,
     session: RealtimeVoiceAgentSession,
@@ -2136,6 +2332,12 @@ async def _handle_realtime_sideband_function_call(
     if not isinstance(parsed_args, dict):
         parsed_args = {}
 
+    _shadow_realtime_tool_call(
+        session,
+        name=name,
+        call_id=call_id,
+        raw_arguments=raw_arguments or "{}",
+    )
     output = await asyncio.to_thread(
         _execute_realtime_agent_tool_call,
         session=session,
@@ -2143,6 +2345,7 @@ async def _handle_realtime_sideband_function_call(
         arguments=parsed_args,
         call_id=call_id,
     )
+    _shadow_realtime_tool_output(session, name=name, call_id=call_id, output=output)
     await _send_realtime_sideband_event(
         ws,
         {
@@ -2181,6 +2384,7 @@ async def _realtime_sideband_loop(session: RealtimeVoiceAgentSession) -> None:
                     continue
                 if not isinstance(event, dict):
                     continue
+                _shadow_realtime_event(session, event)
                 event_type = str(event.get("type") or "")
                 for item in _realtime_function_call_items(event):
                     keys = _realtime_function_call_keys(item)
@@ -2265,6 +2469,7 @@ async def _realtime_sideband_loop(session: RealtimeVoiceAgentSession) -> None:
         else:
             _log.exception("Realtime voice sideband loop failed call_id=%s", session.call_id)
     finally:
+        _flush_realtime_assistant_buffers(session)
         _log.info("Realtime voice sideband disconnected call_id=%s", session.call_id)
 
 
@@ -2289,6 +2494,13 @@ def _start_realtime_voice_sideband(
         agent.session_id = safe_session_id
     except Exception:
         pass
+    try:
+        if getattr(agent, "_cached_system_prompt", None) is None:
+            agent._cached_system_prompt = agent._build_system_prompt(None)
+        if hasattr(agent, "_ensure_db_session"):
+            agent._ensure_db_session()
+    except Exception:
+        _log.debug("Realtime voice session DB row creation failed", exc_info=True)
     realtime_session = RealtimeVoiceAgentSession(
         call_id=call_id,
         agent=agent,
@@ -2297,6 +2509,8 @@ def _start_realtime_voice_sideband(
         enabled_toolsets=list(getattr(agent, "enabled_toolsets", None) or []),
         created_at=time.time(),
         last_event_at=time.time(),
+        shadowed_item_ids=set(),
+        assistant_buffers={},
     )
     task = asyncio.create_task(_realtime_sideband_loop(realtime_session))
     realtime_session.sideband_task = task

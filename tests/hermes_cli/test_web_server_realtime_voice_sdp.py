@@ -63,9 +63,13 @@ class FakeRealtimeAgent:
         self.session_id = "fake-realtime-session"
         self.ephemeral_system_prompt = "CHAT OVERLAY"
         self._cached_system_prompt = None
+        self._session_db = None
 
     def _build_system_prompt(self, _system_message=None):
         return "CHAT PROMPT FROM AIAGENT"
+
+    def _ensure_db_session(self):
+        return None
 
 
 @pytest.fixture
@@ -535,6 +539,72 @@ async def test_realtime_sideband_posts_function_output_and_response_create(monke
         },
         {"type": "response.create"},
     ]
+
+
+def test_realtime_sideband_shadows_transcript_and_tools_to_session_db(monkeypatch):
+    rows: list[dict] = []
+
+    class FakeDB:
+        def append_message(self, session_id, role, **kwargs):
+            rows.append({"session_id": session_id, "role": role, **kwargs})
+            return len(rows)
+
+    agent = FakeRealtimeAgent()
+    agent._session_db = FakeDB()
+    session = web_server.RealtimeVoiceAgentSession(
+        call_id="rtc_shadow",
+        agent=agent,
+        api_key="sk-test",
+        cwd="/tmp/workspace",
+        enabled_toolsets=agent.enabled_toolsets,
+        shadowed_item_ids=set(),
+        assistant_buffers={},
+    )
+
+    web_server._shadow_realtime_event(
+        session,
+        {
+            "type": "conversation.item.input_audio_transcription.completed",
+            "item_id": "user_1",
+            "transcript": "what is the plan",
+        },
+    )
+    web_server._shadow_realtime_event(
+        session,
+        {
+            "type": "response.audio_transcript.delta",
+            "response_id": "resp_1",
+            "delta": "Use ",
+        },
+    )
+    web_server._shadow_realtime_event(
+        session,
+        {
+            "type": "response.audio_transcript.delta",
+            "response_id": "resp_1",
+            "delta": "subagents.",
+        },
+    )
+    web_server._shadow_realtime_event(session, {"type": "response.done"})
+    web_server._shadow_realtime_tool_call(
+        session,
+        name="delegate_task",
+        call_id="call_delegate",
+        raw_arguments='{"goal":"think"}',
+    )
+    web_server._shadow_realtime_tool_output(
+        session,
+        name="delegate_task",
+        call_id="call_delegate",
+        output='{"result":"done"}',
+    )
+
+    assert [row["role"] for row in rows] == ["user", "assistant", "assistant", "tool"]
+    assert rows[0]["content"] == "what is the plan"
+    assert rows[1]["content"] == "Use subagents."
+    assert rows[2]["tool_calls"][0]["function"]["name"] == "delegate_task"
+    assert rows[3]["tool_name"] == "delegate_task"
+    assert rows[3]["content"] == '{"result":"done"}'
 
 
 def test_realtime_voice_tool_endpoint_wraps_unexpected_failures(client, monkeypatch):
