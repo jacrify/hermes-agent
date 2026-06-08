@@ -554,6 +554,7 @@ export function DesktopController() {
   }, [activeGatewayProfile, refreshCurrentModel])
 
   const composer = useComposerActions({
+    activeGatewayProfile,
     activeSessionId,
     currentCwd,
     requestGateway
