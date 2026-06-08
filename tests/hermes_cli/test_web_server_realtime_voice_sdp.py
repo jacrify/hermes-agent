@@ -1,5 +1,6 @@
 """Contract tests for the dashboard Realtime voice SDP endpoint."""
 
+import logging
 import sys
 from types import SimpleNamespace
 
@@ -310,6 +311,76 @@ def test_realtime_tool_execution_uses_scoped_model_tools(monkeypatch):
     assert captured["handle_kwargs"]["function_args"] == {"query": "Hermes"}
     assert captured["handle_kwargs"]["tool_call_id"] == "call_456"
     assert captured["handle_kwargs"]["enabled_toolsets"] == ["web", "mcp-files"]
+
+
+def test_realtime_tool_execution_logs_cwd_context(monkeypatch, caplog, tmp_path):
+    captured: dict[str, object] = {}
+
+    def fake_get_tool_definitions(**_kwargs):
+        return [FAKE_TOOL_DEF]
+
+    def fake_handle_function_call(**kwargs):
+        captured["handle_kwargs"] = kwargs
+        return '{"result": "ok"}'
+
+    fake_model_tools = SimpleNamespace(
+        get_tool_definitions=fake_get_tool_definitions,
+        handle_function_call=fake_handle_function_call,
+    )
+    monkeypatch.setitem(sys.modules, "model_tools", fake_model_tools)
+    monkeypatch.setattr(web_server, "_realtime_enabled_toolsets", lambda: ["web"])
+    monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
+
+    with caplog.at_level(logging.INFO, logger="hermes_cli.web_server"):
+        result = web_server._execute_realtime_tool_call(
+            name="web_search",
+            arguments={"query": "Hermes"},
+            call_id="call_logged",
+        )
+
+    assert result == '{"result": "ok"}'
+    messages = [record.getMessage() for record in caplog.records]
+    assert any(
+        "Realtime voice tool call started name=web_search call_id=call_logged"
+        in message
+        and f"terminal_cwd={tmp_path}" in message
+        for message in messages
+    )
+    assert any(
+        "Realtime voice tool call finished name=web_search call_id=call_logged"
+        in message
+        and "output_chars=16" in message
+        for message in messages
+    )
+
+
+def test_realtime_voice_tool_endpoint_wraps_unexpected_failures(client, monkeypatch):
+    def fail_execute_realtime_tool_call(**_kwargs):
+        raise RuntimeError("tool transport exploded")
+
+    monkeypatch.setattr(
+        web_server,
+        "_execute_realtime_tool_call",
+        fail_execute_realtime_tool_call,
+    )
+
+    response = client.post(
+        TOOL_ENDPOINT,
+        json={
+            "name": "web_search",
+            "arguments": {"query": "Hermes"},
+            "call_id": "call_failure",
+        },
+        headers=_json_auth_headers(),
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["ok"] is True
+    assert payload["name"] == "web_search"
+    assert payload["call_id"] == "call_failure"
+    assert "tool transport exploded" in payload["output"]
+    assert '"status": "error"' in payload["output"]
 
 
 def test_realtime_tool_execution_rejects_agent_loop_tool():
