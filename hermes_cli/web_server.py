@@ -23,6 +23,7 @@ import logging
 import os
 import re
 import secrets
+import socket
 import stat
 import subprocess
 import sys
@@ -8307,6 +8308,24 @@ def _resolve_chat_argv(
     return list(argv), str(cwd) if cwd else None, env
 
 
+def _dashboard_child_connect_host(bound_host: Optional[str]) -> Optional[str]:
+    """Return a concrete host that server-spawned child processes can dial."""
+    override = os.environ.get("HERMES_DASHBOARD_INTERNAL_HOST", "").strip()
+    if override:
+        return override
+
+    host = (bound_host or "").strip()
+    if host and host not in {"0.0.0.0", "::"}:
+        return host
+
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.connect(("1.1.1.1", 80))
+            return str(sock.getsockname()[0])
+    except Exception:
+        return "127.0.0.1"
+
+
 def _build_gateway_ws_url() -> Optional[str]:
     """ws:// URL the PTY child should attach to for JSON-RPC gateway traffic.
 
@@ -8318,7 +8337,7 @@ def _build_gateway_ws_url() -> Optional[str]:
     the child reads this URL once at startup and reuses it on every reconnect,
     and a 30s-TTL ticket can expire before a slow cold boot even dials.
     """
-    host = getattr(app.state, "bound_host", None)
+    host = _dashboard_child_connect_host(getattr(app.state, "bound_host", None))
     port = getattr(app.state, "bound_port", None)
 
     if not host or not port:
@@ -8354,7 +8373,7 @@ def _build_sidecar_url(channel: str) -> Optional[str]:
     Connections authenticated this way are recorded under the
     ``server-internal`` identity in the audit log.
     """
-    host = getattr(app.state, "bound_host", None)
+    host = _dashboard_child_connect_host(getattr(app.state, "bound_host", None))
     port = getattr(app.state, "bound_port", None)
 
     if not host or not port:
@@ -8469,10 +8488,26 @@ async def pty_ws(ws: WebSocket) -> None:
     sidecar_url = _build_sidecar_url(channel) if channel else None
 
     try:
-        argv, cwd, env = _resolve_chat_argv(resume=resume, sidecar_url=sidecar_url)
+        await ws.send_text("\r\n\x1b[90m[starting Hermes chat...]\x1b[0m\r\n")
+        resolve_task = asyncio.create_task(
+            asyncio.to_thread(
+                _resolve_chat_argv,
+                resume=resume,
+                sidecar_url=sidecar_url,
+            )
+        )
+        while not resolve_task.done():
+            await asyncio.sleep(3)
+            if not resolve_task.done():
+                await ws.send_text("\x1b[90m.\x1b[0m")
+        argv, cwd, env = await resolve_task
     except SystemExit as exc:
         # _make_tui_argv calls sys.exit(1) when node/npm is missing.
         await ws.send_text(f"\r\n\x1b[31mChat unavailable: {exc}\x1b[0m\r\n")
+        await ws.close(code=1011)
+        return
+    except Exception as exc:
+        await ws.send_text(f"\r\n\x1b[31mChat failed to prepare: {exc}\x1b[0m\r\n")
         await ws.close(code=1011)
         return
 
