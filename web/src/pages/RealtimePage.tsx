@@ -181,6 +181,7 @@ export default function RealtimePage() {
   const completedToolCallsRef = useRef<Set<string>>(new Set());
   const pendingFunctionCallsRef = useRef<Map<string, RealtimeFunctionCallItem>>(new Map());
   const functionArgumentBuffersRef = useRef<Map<string, string>>(new Map());
+  const sidebandToolsRef = useRef(false);
   const micMutedRef = useRef(micMuted);
   const speakerMutedRef = useRef(speakerMuted);
 
@@ -252,6 +253,7 @@ export default function RealtimePage() {
     completedToolCallsRef.current.clear();
     pendingFunctionCallsRef.current.clear();
     functionArgumentBuffersRef.current.clear();
+    sidebandToolsRef.current = false;
 
     const pc = pcRef.current;
     if (pc) {
@@ -401,6 +403,9 @@ export default function RealtimePage() {
     const type = event.type;
     const functionCall = functionCallFromRealtimeEvent(event);
     if (functionCall) {
+      if (sidebandToolsRef.current) {
+        return;
+      }
       const keys = realtimeFunctionCallKeys(functionCall);
       for (const key of keys) {
         pendingFunctionCallsRef.current.set(key, functionCall);
@@ -422,6 +427,9 @@ export default function RealtimePage() {
     }
 
     if (type === "response.function_call_arguments.delta") {
+      if (sidebandToolsRef.current) {
+        return;
+      }
       const keys = [
         stringFromEvent(event.call_id),
         stringFromEvent(event.item_id),
@@ -439,6 +447,9 @@ export default function RealtimePage() {
     }
 
     if (type === "response.function_call_arguments.done") {
+      if (sidebandToolsRef.current) {
+        return;
+      }
       const keys = [
         stringFromEvent(event.call_id),
         stringFromEvent(event.item_id),
@@ -601,6 +612,8 @@ export default function RealtimePage() {
         const body = await response.text().catch(() => response.statusText);
         throw new Error(`${response.status}: ${body || response.statusText}`);
       }
+      sidebandToolsRef.current = response.headers.get("X-Hermes-Realtime-Sideband") === "1";
+      pushEvent(sidebandToolsRef.current ? "sideband.tools" : "browser.tools");
       const answerSdp = await response.text();
       if (!isCurrentRun()) return;
       await pc.setRemoteDescription({ type: "answer", sdp: answerSdp });

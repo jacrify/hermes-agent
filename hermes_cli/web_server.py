@@ -91,6 +91,17 @@ except ImportError:
 WEB_DIST = Path(os.environ["HERMES_WEB_DIST"]) if "HERMES_WEB_DIST" in os.environ else Path(__file__).parent / "web_dist"
 _log = logging.getLogger(__name__)
 
+
+def _prompt_text(value: Any) -> str:
+    """Normalize config prompt values from YAML before handing them to AIAgent."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, list):
+        return "\n".join(str(item).strip() for item in value if str(item).strip())
+    return str(value).strip()
+
 # ---------------------------------------------------------------------------
 # Per-channel subscriber registry used by /api/pub (PTY-side gateway → dashboard)
 # and /api/events (dashboard → browser sidebar).  Keyed by an opaque channel id
@@ -204,6 +215,7 @@ _DESKTOP_UPLOAD_IMAGE_EXTENSIONS = {
 _DESKTOP_UPLOAD_IMAGE_MAX_BYTES = 25 * 1024 * 1024
 _REALTIME_SDP_MAX_BYTES = 512 * 1024
 _OPENAI_REALTIME_CALLS_URL = "https://api.openai.com/v1/realtime/calls"
+_OPENAI_REALTIME_SIDEBAND_URL = "wss://api.openai.com/v1/realtime"
 _REALTIME_UNSUPPORTED_AGENT_LOOP_TOOLS = {
     "delegate_task",
     "memory",
@@ -211,6 +223,31 @@ _REALTIME_UNSUPPORTED_AGENT_LOOP_TOOLS = {
     "todo",
 }
 _REALTIME_TOOL_RESULT_MAX_CHARS = 12000
+_REALTIME_VOICE_ADDENDUM = (
+    "Realtime voice transport addendum: this is a spoken realtime session. "
+    "Keep spoken replies brief, natural, and interruption-friendly. "
+    "Never claim a tool succeeded until the tool output has been returned. "
+    "Ask John for explicit spoken confirmation before destructive actions, "
+    "external sends, purchases, deletes, broad file rewrites, or credential "
+    "changes. If a tool result is long, summarize the useful part and offer "
+    "to continue."
+)
+
+
+@dataclass
+class RealtimeVoiceAgentSession:
+    call_id: str
+    agent: Any
+    api_key: str
+    cwd: str
+    enabled_toolsets: List[str]
+    sideband_task: Optional[asyncio.Task] = None
+    created_at: float = 0.0
+    last_event_at: float = 0.0
+
+
+_realtime_voice_sessions: Dict[str, RealtimeVoiceAgentSession] = {}
+_realtime_voice_sessions_lock = threading.RLock()
 
 # Simple rate limiter for the reveal endpoint
 _reveal_timestamps: List[float] = []
@@ -1670,6 +1707,159 @@ def _realtime_tool_definitions(
     return filtered, enabled_toolsets, sorted(skipped)
 
 
+def _realtime_agent_model_config(config: Optional[Dict[str, Any]] = None) -> Tuple[str, Optional[str]]:
+    cfg = config if isinstance(config, dict) else load_config()
+    model_cfg = cfg.get("model", {}) if isinstance(cfg, dict) else {}
+    if not isinstance(model_cfg, dict):
+        model_cfg = {}
+    model = (
+        os.environ.get("HERMES_MODEL", "").strip()
+        or os.environ.get("HERMES_INFERENCE_MODEL", "").strip()
+        or str(model_cfg.get("default", "") or "").strip()
+        or "anthropic/claude-sonnet-4"
+    )
+    provider = (
+        os.environ.get("HERMES_TUI_PROVIDER", "").strip()
+        or os.environ.get("HERMES_INFERENCE_PROVIDER", "").strip()
+        or str(model_cfg.get("provider", "") or "").strip()
+        or None
+    )
+    return model, provider
+
+
+def _realtime_reasoning_config(config: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+    cfg = config if isinstance(config, dict) else load_config()
+    raw = ""
+    if isinstance(cfg, dict):
+        agent_cfg = cfg.get("agent") or {}
+        if isinstance(agent_cfg, dict):
+            raw = str(agent_cfg.get("reasoning_effort", "") or "").strip()
+    try:
+        from hermes_constants import parse_reasoning_effort
+
+        return parse_reasoning_effort(raw)
+    except Exception:
+        return None
+
+
+def _realtime_service_tier(config: Optional[Dict[str, Any]] = None) -> Optional[str]:
+    cfg = config if isinstance(config, dict) else load_config()
+    raw = ""
+    if isinstance(cfg, dict):
+        agent_cfg = cfg.get("agent") or {}
+        if isinstance(agent_cfg, dict):
+            raw = str(agent_cfg.get("service_tier", "") or "").strip().lower()
+    if not raw or raw in {"normal", "default", "standard", "off", "none"}:
+        return None
+    if raw in {"fast", "priority", "on"}:
+        return "priority"
+    return None
+
+
+def _realtime_max_turns(config: Optional[Dict[str, Any]] = None, default: int = 90) -> int:
+    cfg = config if isinstance(config, dict) else load_config()
+    try:
+        env_value = int(os.environ.get("HERMES_TUI_MAX_TURNS", "") or 0)
+        if env_value > 0:
+            return env_value
+    except (TypeError, ValueError):
+        pass
+    if isinstance(cfg, dict):
+        agent_cfg = cfg.get("agent") or {}
+        if isinstance(agent_cfg, dict):
+            return int(agent_cfg.get("max_turns") or cfg.get("max_turns") or default)
+        return int(cfg.get("max_turns") or default)
+    return default
+
+
+_realtime_session_db = None
+_realtime_session_db_error = ""
+
+
+def _get_realtime_session_db():
+    global _realtime_session_db, _realtime_session_db_error
+    if _realtime_session_db is not None:
+        return _realtime_session_db
+    try:
+        from hermes_state import SessionDB
+
+        _realtime_session_db = SessionDB()
+        _realtime_session_db_error = ""
+        return _realtime_session_db
+    except Exception as exc:
+        _realtime_session_db_error = str(exc)
+        _log.warning("Realtime voice session DB unavailable: %s", exc)
+        return None
+
+
+def _create_realtime_voice_agent(
+    *,
+    config: Optional[Dict[str, Any]] = None,
+    session_id: str = "realtime-voice-pending",
+) -> Any:
+    cfg = config if isinstance(config, dict) else load_config()
+    _bridge_realtime_terminal_cwd(cfg)
+    enabled_toolsets = _realtime_enabled_toolsets(cfg)
+    model, requested_provider = _realtime_agent_model_config(cfg)
+    try:
+        from hermes_cli.runtime_provider import resolve_runtime_provider
+        from run_agent import AIAgent
+
+        runtime = resolve_runtime_provider(
+            requested=requested_provider,
+            target_model=model or None,
+        )
+        agent_cfg = cfg.get("agent") or {}
+        ephemeral_system_prompt = _prompt_text(
+            agent_cfg.get("system_prompt", "") if isinstance(agent_cfg, dict) else ""
+        )
+        return AIAgent(
+            model=model,
+            max_iterations=_realtime_max_turns(cfg),
+            provider=runtime.get("provider"),
+            base_url=runtime.get("base_url"),
+            api_key=runtime.get("api_key"),
+            api_mode=runtime.get("api_mode"),
+            acp_command=runtime.get("command"),
+            acp_args=runtime.get("args"),
+            credential_pool=runtime.get("credential_pool"),
+            quiet_mode=True,
+            verbose_logging=False,
+            reasoning_config=_realtime_reasoning_config(cfg),
+            service_tier=_realtime_service_tier(cfg),
+            enabled_toolsets=enabled_toolsets,
+            platform="tui",
+            session_id=session_id,
+            session_db=_get_realtime_session_db(),
+            ephemeral_system_prompt=ephemeral_system_prompt or None,
+            checkpoints_enabled=False,
+            pass_session_id=env_var_enabled("HERMES_TUI_PASS_SESSION_ID"),
+            skip_context_files=env_var_enabled("HERMES_IGNORE_RULES"),
+            skip_memory=env_var_enabled("HERMES_IGNORE_RULES"),
+        )
+    except Exception:
+        _log.exception("Realtime voice AIAgent creation failed")
+        raise
+
+
+def _realtime_tool_definitions_from_agent(agent: Any) -> List[Dict[str, Any]]:
+    tools: List[Dict[str, Any]] = []
+    for tool_def in getattr(agent, "tools", []) or []:
+        realtime_tool = _realtime_tool_definition(tool_def)
+        if realtime_tool:
+            tools.append(realtime_tool)
+    return tools
+
+
+def _realtime_voice_agent_instructions(agent: Any) -> str:
+    if getattr(agent, "_cached_system_prompt", None) is None:
+        agent._cached_system_prompt = agent._build_system_prompt(None)
+    effective = agent._cached_system_prompt or ""
+    if getattr(agent, "ephemeral_system_prompt", None):
+        effective = (effective + "\n\n" + agent.ephemeral_system_prompt).strip()
+    return (effective + "\n\n" + _REALTIME_VOICE_ADDENDUM).strip()
+
+
 def _realtime_voice_instructions(
     *,
     tool_count: int,
@@ -1701,7 +1891,7 @@ def _realtime_voice_instructions(
     )
 
 
-def _default_realtime_session_config() -> Dict[str, Any]:
+def _default_realtime_session_config(*, agent: Any = None) -> Dict[str, Any]:
     cfg = load_config()
     _bridge_realtime_terminal_cwd(cfg)
     realtime_cfg = cfg.get("realtime", {})
@@ -1717,14 +1907,19 @@ def _default_realtime_session_config() -> Dict[str, Any]:
         or str(realtime_cfg.get("voice", "") or "").strip()
         or "marin"
     )
-    tools, _enabled_toolsets, skipped_tools = _realtime_tool_definitions(config=cfg)
+    if agent is None:
+        tools, _enabled_toolsets, skipped_tools = _realtime_tool_definitions(config=cfg)
+        instructions = _realtime_voice_instructions(
+            tool_count=len(tools),
+            skipped_tools=skipped_tools,
+        )
+    else:
+        tools = _realtime_tool_definitions_from_agent(agent)
+        instructions = _realtime_voice_agent_instructions(agent)
     return {
         "type": "realtime",
         "model": model,
-        "instructions": _realtime_voice_instructions(
-            tool_count=len(tools),
-            skipped_tools=skipped_tools,
-        ),
+        "instructions": instructions,
         "audio": {
             "output": {
                 "voice": voice,
@@ -1786,6 +1981,326 @@ def _post_openai_realtime_call(
         answer = res.read().decode("utf-8")
         call_id = res.headers.get("Location")
     return answer, call_id
+
+
+def _normalize_realtime_call_id(call_id: Optional[str]) -> str:
+    raw = (call_id or "").strip()
+    if not raw:
+        return ""
+    return raw.rstrip("/").rsplit("/", 1)[-1]
+
+
+def _realtime_sideband_enabled(config: Optional[Dict[str, Any]] = None) -> bool:
+    env_value = os.environ.get("HERMES_REALTIME_SIDEBAND", "").strip().lower()
+    if env_value in {"0", "false", "no", "off"}:
+        return False
+    if env_value in {"1", "true", "yes", "on"}:
+        return True
+    cfg = config if isinstance(config, dict) else load_config()
+    realtime_cfg = cfg.get("realtime", {}) if isinstance(cfg, dict) else {}
+    if isinstance(realtime_cfg, dict) and realtime_cfg.get("sideband") is False:
+        return False
+    return True
+
+
+def _realtime_sideband_import_available() -> bool:
+    try:
+        import websockets  # noqa: F401
+
+        return True
+    except Exception:
+        return False
+
+
+def _open_openai_realtime_sideband(*, call_id: str, api_key: str):
+    import websockets
+
+    url = f"{_OPENAI_REALTIME_SIDEBAND_URL}?call_id={urllib.parse.quote(call_id)}"
+    headers = {"Authorization": f"Bearer {api_key}"}
+    try:
+        return websockets.connect(url, additional_headers=headers)
+    except TypeError:
+        return websockets.connect(url, extra_headers=headers)
+
+
+async def _send_realtime_sideband_event(ws: Any, payload: Dict[str, Any]) -> None:
+    await ws.send(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+
+
+def _realtime_function_call_keys(item: Dict[str, Any]) -> List[str]:
+    keys: List[str] = []
+    for key in ("call_id", "id", "item_id"):
+        value = item.get(key)
+        if isinstance(value, str) and value:
+            keys.append(value)
+    return keys
+
+
+def _realtime_function_call_items(event: Dict[str, Any]) -> List[Dict[str, Any]]:
+    items: List[Dict[str, Any]] = []
+    item = event.get("item")
+    if isinstance(item, dict) and item.get("type") == "function_call":
+        items.append(item)
+    response = event.get("response")
+    if isinstance(response, dict):
+        output = response.get("output")
+        if isinstance(output, list):
+            for candidate in output:
+                if isinstance(candidate, dict) and candidate.get("type") == "function_call":
+                    items.append(candidate)
+    return items
+
+
+def _execute_realtime_agent_tool_call(
+    *,
+    session: RealtimeVoiceAgentSession,
+    name: str,
+    arguments: Dict[str, Any],
+    call_id: str,
+) -> str:
+    started_at = time.monotonic()
+    _bridge_realtime_terminal_cwd()
+    agent = session.agent
+    valid_tool_names = set(getattr(agent, "valid_tool_names", set()) or set())
+    tool_name = name
+    if tool_name not in valid_tool_names:
+        try:
+            from agent.agent_runtime_helpers import repair_tool_call
+
+            repaired = repair_tool_call(agent, tool_name)
+        except Exception:
+            repaired = None
+        if repaired:
+            tool_name = repaired
+    _log.info(
+        "Realtime voice sideband tool call started name=%s call_id=%s session=%s cwd=%s",
+        tool_name,
+        call_id,
+        session.call_id,
+        session.cwd or "<unset>",
+    )
+    if tool_name not in valid_tool_names:
+        result = json.dumps(
+            {
+                "error": f"{name} is not available in this realtime voice session.",
+                "status": "unavailable",
+            },
+            ensure_ascii=False,
+        )
+    else:
+        try:
+            from agent.agent_runtime_helpers import invoke_tool
+
+            result = invoke_tool(
+                agent,
+                tool_name,
+                arguments if isinstance(arguments, dict) else {},
+                f"realtime-voice-{session.call_id}",
+                tool_call_id=call_id,
+            )
+        except Exception as exc:
+            _log.exception("Realtime voice sideband tool call failed: %s", tool_name)
+            result = json.dumps(
+                {"error": f"Realtime voice tool call failed: {exc}", "status": "error"},
+                ensure_ascii=False,
+            )
+    if not isinstance(result, str):
+        result = json.dumps(result, ensure_ascii=False, default=str)
+    _log.info(
+        "Realtime voice sideband tool call finished name=%s call_id=%s session=%s duration_ms=%d output_chars=%d",
+        tool_name,
+        call_id,
+        session.call_id,
+        int((time.monotonic() - started_at) * 1000),
+        len(result),
+    )
+    return _truncate_realtime_tool_output(result)
+
+
+async def _handle_realtime_sideband_function_call(
+    session: RealtimeVoiceAgentSession,
+    ws: Any,
+    item: Dict[str, Any],
+    *,
+    arguments_override: Optional[str] = None,
+) -> None:
+    name = str(item.get("name") or "").strip()
+    call_id = str(item.get("call_id") or item.get("id") or secrets.token_hex(8)).strip()
+    raw_arguments = arguments_override
+    if raw_arguments is None:
+        raw_arguments = item.get("arguments") if isinstance(item.get("arguments"), str) else "{}"
+    try:
+        parsed_args = json.loads(raw_arguments or "{}")
+    except json.JSONDecodeError:
+        parsed_args = {}
+    if not isinstance(parsed_args, dict):
+        parsed_args = {}
+
+    output = await asyncio.to_thread(
+        _execute_realtime_agent_tool_call,
+        session=session,
+        name=name,
+        arguments=parsed_args,
+        call_id=call_id,
+    )
+    await _send_realtime_sideband_event(
+        ws,
+        {
+            "type": "conversation.item.create",
+            "item": {
+                "type": "function_call_output",
+                "call_id": call_id,
+                "output": output,
+            },
+        },
+    )
+    await _send_realtime_sideband_event(ws, {"type": "response.create"})
+    _log.info(
+        "Realtime voice sideband function output posted name=%s call_id=%s session=%s",
+        name,
+        call_id,
+        session.call_id,
+    )
+
+
+async def _realtime_sideband_loop(session: RealtimeVoiceAgentSession) -> None:
+    pending: Dict[str, Dict[str, Any]] = {}
+    argument_buffers: Dict[str, str] = {}
+    completed: set[str] = set()
+    try:
+        async with _open_openai_realtime_sideband(
+            call_id=session.call_id,
+            api_key=session.api_key,
+        ) as ws:
+            _log.info("Realtime voice sideband connected call_id=%s", session.call_id)
+            async for raw in ws:
+                session.last_event_at = time.time()
+                try:
+                    event = json.loads(raw)
+                except Exception:
+                    continue
+                if not isinstance(event, dict):
+                    continue
+                event_type = str(event.get("type") or "")
+                for item in _realtime_function_call_items(event):
+                    keys = _realtime_function_call_keys(item)
+                    for key in keys:
+                        pending[key] = item
+                        if isinstance(item.get("arguments"), str):
+                            argument_buffers[key] = item["arguments"]
+                    if event_type == "response.output_item.done":
+                        call_id = str(item.get("call_id") or item.get("id") or "")
+                        if call_id and call_id in completed:
+                            continue
+                        if call_id:
+                            completed.add(call_id)
+                        args = next(
+                            (
+                                argument_buffers.get(key)
+                                for key in keys
+                                if argument_buffers.get(key) is not None
+                            ),
+                            item.get("arguments") if isinstance(item.get("arguments"), str) else None,
+                        )
+                        await _handle_realtime_sideband_function_call(
+                            session,
+                            ws,
+                            item,
+                            arguments_override=args,
+                        )
+                    elif event_type == "response.done":
+                        call_id = str(item.get("call_id") or item.get("id") or "")
+                        if call_id and call_id not in completed:
+                            completed.add(call_id)
+                            await _handle_realtime_sideband_function_call(session, ws, item)
+                if event_type == "response.function_call_arguments.delta":
+                    delta = event.get("delta")
+                    if isinstance(delta, str) and delta:
+                        for key_name in ("call_id", "item_id"):
+                            key = event.get(key_name)
+                            if isinstance(key, str) and key:
+                                argument_buffers[key] = argument_buffers.get(key, "") + delta
+                elif event_type == "response.function_call_arguments.done":
+                    keys = [
+                        event.get("call_id") if isinstance(event.get("call_id"), str) else "",
+                        event.get("item_id") if isinstance(event.get("item_id"), str) else "",
+                    ]
+                    item = next((pending[key] for key in keys if key and key in pending), None)
+                    name = event.get("name") if isinstance(event.get("name"), str) else None
+                    if item is None and name:
+                        item = {
+                            "type": "function_call",
+                            "name": name,
+                            "call_id": event.get("call_id"),
+                            "id": event.get("item_id"),
+                        }
+                    if item is not None:
+                        call_id = str(item.get("call_id") or event.get("call_id") or item.get("id") or "")
+                        if call_id and call_id in completed:
+                            continue
+                        if call_id:
+                            completed.add(call_id)
+                        args = (
+                            event.get("arguments")
+                            if isinstance(event.get("arguments"), str)
+                            else next((argument_buffers.get(key) for key in keys if key and argument_buffers.get(key) is not None), None)
+                        )
+                        await _handle_realtime_sideband_function_call(
+                            session,
+                            ws,
+                            item,
+                            arguments_override=args,
+                        )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        _log.exception("Realtime voice sideband loop failed call_id=%s", session.call_id)
+    finally:
+        _log.info("Realtime voice sideband disconnected call_id=%s", session.call_id)
+
+
+def _start_realtime_voice_sideband(
+    *,
+    raw_call_id: Optional[str],
+    agent: Any,
+    api_key: str,
+    config: Optional[Dict[str, Any]] = None,
+) -> Optional[RealtimeVoiceAgentSession]:
+    call_id = _normalize_realtime_call_id(raw_call_id)
+    if not call_id:
+        return None
+    if not _realtime_sideband_enabled(config):
+        return None
+    if not _realtime_sideband_import_available():
+        _log.warning("Realtime voice sideband unavailable: websockets package is not importable")
+        return None
+
+    safe_session_id = "realtime-voice-" + re.sub(r"[^A-Za-z0-9_.:-]+", "-", call_id)
+    try:
+        agent.session_id = safe_session_id
+    except Exception:
+        pass
+    realtime_session = RealtimeVoiceAgentSession(
+        call_id=call_id,
+        agent=agent,
+        api_key=api_key,
+        cwd=os.environ.get("TERMINAL_CWD", ""),
+        enabled_toolsets=list(getattr(agent, "enabled_toolsets", None) or []),
+        created_at=time.time(),
+        last_event_at=time.time(),
+    )
+    task = asyncio.create_task(_realtime_sideband_loop(realtime_session))
+    realtime_session.sideband_task = task
+    with _realtime_voice_sessions_lock:
+        _realtime_voice_sessions[call_id] = realtime_session
+    _log.info(
+        "Realtime voice sideband session started call_id=%s hermes_session_id=%s tools=%d cwd=%s",
+        call_id,
+        safe_session_id,
+        len(getattr(agent, "tools", []) or []),
+        realtime_session.cwd or "<unset>",
+    )
+    return realtime_session
 
 
 def _truncate_realtime_tool_output(output: str) -> str:
@@ -1965,7 +2480,12 @@ async def create_realtime_voice_sdp(request: Request):
             detail="Set VOICE_TOOLS_OPENAI_KEY or OPENAI_API_KEY to use realtime voice",
         )
 
-    session = _default_realtime_session_config()
+    cfg = load_config()
+    realtime_agent = await asyncio.to_thread(
+        _create_realtime_voice_agent,
+        config=cfg,
+    )
+    session = _default_realtime_session_config(agent=realtime_agent)
     try:
         answer_sdp, call_id = await asyncio.to_thread(
             _post_openai_realtime_call,
@@ -1993,6 +2513,15 @@ async def create_realtime_voice_sdp(request: Request):
     headers = {"Cache-Control": "no-store"}
     if call_id:
         headers["X-Hermes-Realtime-Call"] = call_id
+    sideband_session = _start_realtime_voice_sideband(
+        raw_call_id=call_id,
+        agent=realtime_agent,
+        api_key=api_key,
+        config=cfg,
+    )
+    if sideband_session is not None:
+        headers["X-Hermes-Realtime-Sideband"] = "1"
+        headers["X-Hermes-Realtime-Session"] = getattr(realtime_agent, "session_id", "")
     return Response(content=answer_sdp, media_type="application/sdp", headers=headers)
 
 

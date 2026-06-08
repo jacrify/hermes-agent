@@ -55,6 +55,19 @@ FAKE_REALTIME_TOOL_DEF = {
 }
 
 
+class FakeRealtimeAgent:
+    def __init__(self):
+        self.tools = [FAKE_TOOL_DEF]
+        self.valid_tool_names = {"web_search", "memory", "todo", "delegate_task", "session_search"}
+        self.enabled_toolsets = ["web", "memory", "todo", "delegation", "session_search"]
+        self.session_id = "fake-realtime-session"
+        self.ephemeral_system_prompt = "CHAT OVERLAY"
+        self._cached_system_prompt = None
+
+    def _build_system_prompt(self, _system_message=None):
+        return "CHAT PROMPT FROM AIAGENT"
+
+
 @pytest.fixture
 def client():
     prev_host = getattr(web_server.app.state, "bound_host", None)
@@ -125,11 +138,8 @@ def test_realtime_voice_sdp_accepts_sdp_and_returns_answer_text(
 
     monkeypatch.setenv("VOICE_TOOLS_OPENAI_KEY", "sk-test-realtime")
     monkeypatch.setattr(web_server, "load_env", lambda: {})
-    monkeypatch.setattr(
-        web_server,
-        "_realtime_tool_definitions",
-        lambda config=None: ([FAKE_TOOL_DEF], ["web"], ["memory"]),
-    )
+    monkeypatch.setattr(web_server, "_create_realtime_voice_agent", lambda **_kwargs: FakeRealtimeAgent())
+    monkeypatch.setattr(web_server, "_start_realtime_voice_sideband", lambda **_kwargs: None)
 
     def fake_post_openai_realtime_call(**kwargs):
         captured.update(kwargs)
@@ -153,7 +163,21 @@ def test_realtime_voice_sdp_accepts_sdp_and_returns_answer_text(
     assert captured["session"]["audio"]["output"]["voice"] == "marin"
     assert captured["session"]["tool_choice"] == "auto"
     assert captured["session"]["tools"] == [FAKE_REALTIME_TOOL_DEF]
-    assert "memory" in captured["session"]["instructions"]
+    assert "CHAT PROMPT FROM AIAGENT" in captured["session"]["instructions"]
+    assert "CHAT OVERLAY" in captured["session"]["instructions"]
+    assert "spoken realtime session" in captured["session"]["instructions"]
+
+
+def test_default_realtime_session_config_uses_chat_agent_prompt_plus_voice_addendum(monkeypatch):
+    monkeypatch.setattr(web_server, "load_config", lambda: {"terminal": {"cwd": ""}})
+
+    session = web_server._default_realtime_session_config(agent=FakeRealtimeAgent())
+
+    assert session["type"] == "realtime"
+    assert session["tools"] == [FAKE_REALTIME_TOOL_DEF]
+    assert "CHAT PROMPT FROM AIAGENT" in session["instructions"]
+    assert "CHAT OVERLAY" in session["instructions"]
+    assert "spoken realtime session" in session["instructions"]
 
 
 def test_realtime_tool_definitions_flatten_chat_completion_tool_shape(monkeypatch):
@@ -175,6 +199,35 @@ def test_realtime_tool_definitions_flatten_chat_completion_tool_shape(monkeypatc
     assert tools == [FAKE_REALTIME_TOOL_DEF]
     assert enabled_toolsets == ["web"]
     assert skipped_tools == []
+
+
+def test_realtime_tool_definitions_from_agent_include_agent_loop_tools():
+    agent = FakeRealtimeAgent()
+    agent.tools = [
+        FAKE_TOOL_DEF,
+        {
+            "type": "function",
+            "function": {"name": "memory", "description": "Memory", "parameters": {"type": "object"}},
+        },
+        {
+            "type": "function",
+            "function": {"name": "todo", "description": "Todo", "parameters": {"type": "object"}},
+        },
+        {
+            "type": "function",
+            "function": {"name": "delegate_task", "description": "Delegate", "parameters": {"type": "object"}},
+        },
+        {
+            "type": "function",
+            "function": {"name": "session_search", "description": "Search sessions", "parameters": {"type": "object"}},
+        },
+    ]
+
+    tools = web_server._realtime_tool_definitions_from_agent(agent)
+
+    names = {tool["name"] for tool in tools}
+    assert {"memory", "todo", "delegate_task", "session_search"} <= names
+    assert all(tool["type"] == "function" for tool in tools)
 
 
 def test_openai_realtime_call_uses_ga_multipart_shape(monkeypatch):
@@ -394,6 +447,94 @@ def test_realtime_tool_execution_logs_cwd_context(monkeypatch, caplog, tmp_path)
         and "output_chars=16" in message
         for message in messages
     )
+
+
+@pytest.mark.parametrize("tool_name", ["memory", "todo", "delegate_task", "session_search"])
+def test_realtime_sideband_agent_loop_tools_dispatch_via_invoke_tool(monkeypatch, tool_name):
+    captured: dict[str, object] = {}
+    agent = FakeRealtimeAgent()
+    session = web_server.RealtimeVoiceAgentSession(
+        call_id="rtc_test",
+        agent=agent,
+        api_key="sk-test",
+        cwd="/tmp/workspace",
+        enabled_toolsets=agent.enabled_toolsets,
+    )
+
+    def fake_bridge():
+        return "/tmp/workspace"
+
+    def fake_invoke_tool(*args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return '{"sideband": true}'
+
+    import agent.agent_runtime_helpers as runtime_helpers
+
+    monkeypatch.setattr(web_server, "_bridge_realtime_terminal_cwd", fake_bridge)
+    monkeypatch.setattr(runtime_helpers, "invoke_tool", fake_invoke_tool)
+
+    result = web_server._execute_realtime_agent_tool_call(
+        session=session,
+        name=tool_name,
+        arguments={"x": 1},
+        call_id="call_tool",
+    )
+
+    assert result == '{"sideband": true}'
+    assert captured["args"][:4] == (
+        agent,
+        tool_name,
+        {"x": 1},
+        "realtime-voice-rtc_test",
+    )
+    assert captured["kwargs"]["tool_call_id"] == "call_tool"
+
+
+@pytest.mark.asyncio
+async def test_realtime_sideband_posts_function_output_and_response_create(monkeypatch):
+    sent: list[dict] = []
+    agent = FakeRealtimeAgent()
+    session = web_server.RealtimeVoiceAgentSession(
+        call_id="rtc_sideband",
+        agent=agent,
+        api_key="sk-test",
+        cwd="/tmp/workspace",
+        enabled_toolsets=agent.enabled_toolsets,
+    )
+
+    class FakeWs:
+        async def send(self, payload):
+            sent.append(web_server.json.loads(payload))
+
+    monkeypatch.setattr(
+        web_server,
+        "_execute_realtime_agent_tool_call",
+        lambda **_kwargs: '{"result": "remembered"}',
+    )
+
+    await web_server._handle_realtime_sideband_function_call(
+        session,
+        FakeWs(),
+        {
+            "type": "function_call",
+            "name": "memory",
+            "call_id": "call_memory",
+            "arguments": '{"action":"read"}',
+        },
+    )
+
+    assert sent == [
+        {
+            "type": "conversation.item.create",
+            "item": {
+                "type": "function_call_output",
+                "call_id": "call_memory",
+                "output": '{"result": "remembered"}',
+            },
+        },
+        {"type": "response.create"},
+    ]
 
 
 def test_realtime_voice_tool_endpoint_wraps_unexpected_failures(client, monkeypatch):
