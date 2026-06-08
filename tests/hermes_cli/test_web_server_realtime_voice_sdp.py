@@ -689,6 +689,73 @@ def test_realtime_browser_transcript_event_endpoint_shadows_to_session_db(client
     assert rows[1]["content"] == "Four brothers and four sisters."
 
 
+def test_realtime_voice_background_review_uses_shadow_transcript():
+    calls: list[dict] = []
+
+    class FakeDB:
+        def get_messages(self, session_id):
+            assert session_id == "fake-realtime-session"
+            return [
+                {"role": "user", "content": "remember I prefer short voice answers"},
+                {"role": "assistant", "content": "", "tool_calls": [{"id": "call_1"}], "tool_call_id": "call_1"},
+                {"role": "tool", "content": '{"ok": true}', "tool_name": "memory", "tool_call_id": "call_1"},
+                {"role": "assistant", "content": "Got it."},
+            ]
+
+    agent = FakeRealtimeAgent()
+    agent._session_db = FakeDB()
+
+    def fake_spawn_background_review(**kwargs):
+        kwargs["review_prompt"] = agent._COMBINED_REVIEW_PROMPT
+        calls.append(kwargs)
+
+    agent._spawn_background_review = fake_spawn_background_review
+    session = web_server.RealtimeVoiceAgentSession(
+        call_id="rtc_review",
+        agent=agent,
+        api_key="sk-test",
+        cwd="/tmp/workspace",
+        enabled_toolsets=agent.enabled_toolsets,
+    )
+
+    web_server._spawn_realtime_voice_background_review(session)
+
+    assert len(calls) == 1
+    assert calls[0]["review_memory"] is True
+    assert calls[0]["review_skills"] is True
+    assert "Realtime voice self-improvement routing" in calls[0]["review_prompt"]
+    assert "realtime-specific prompt" in calls[0]["review_prompt"]
+    assert "_COMBINED_REVIEW_PROMPT" not in agent.__dict__
+    assert [m["role"] for m in calls[0]["messages_snapshot"]] == [
+        "user",
+        "assistant",
+        "tool",
+        "assistant",
+    ]
+    assert calls[0]["messages_snapshot"][2]["tool_name"] == "memory"
+
+
+def test_realtime_voice_background_review_requires_user_message():
+    class FakeDB:
+        def get_messages(self, _session_id):
+            return [{"role": "tool", "content": '{"ok": true}', "tool_name": "search_files"}]
+
+    agent = FakeRealtimeAgent()
+    agent._session_db = FakeDB()
+    agent._spawn_background_review = lambda **_kwargs: (_ for _ in ()).throw(
+        AssertionError("review should not spawn without a user message")
+    )
+    session = web_server.RealtimeVoiceAgentSession(
+        call_id="rtc_review_empty",
+        agent=agent,
+        api_key="sk-test",
+        cwd="/tmp/workspace",
+        enabled_toolsets=agent.enabled_toolsets,
+    )
+
+    web_server._spawn_realtime_voice_background_review(session)
+
+
 def test_realtime_voice_tool_endpoint_wraps_unexpected_failures(client, monkeypatch):
     def fail_execute_realtime_tool_call(**_kwargs):
         raise RuntimeError("tool transport exploded")

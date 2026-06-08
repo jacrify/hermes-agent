@@ -241,6 +241,23 @@ _REALTIME_VOICE_ADDENDUM = (
     "need a moment to check or work through it, without mentioning subagents "
     "or background execution unless John explicitly asks how it works."
 )
+_REALTIME_VOICE_REVIEW_PROMPT_ADDENDUM = (
+    "\n\nRealtime voice self-improvement routing:\n"
+    "- This transcript came from Hermes realtime voice, not normal chat. "
+    "Separate general Hermes/user learnings from realtime-specific prompt "
+    "or voice UX learnings.\n"
+    "- Save general durable preferences or reusable task methods through the "
+    "normal memory and skill paths only when they are true outside voice too.\n"
+    "- For realtime-specific lessons, such as when to speak after tool results, "
+    "how to handle interruption, whether to narrate tool mechanics, how to "
+    "phrase spoken progress, or how the realtime prompt should steer tool use, "
+    "do not save them as broad user memory. Create or update an agent-created "
+    "skill/reference for realtime voice prompt guidance instead, with concrete "
+    "candidate prompt wording and the evidence from this transcript.\n"
+    "- If the lesson should eventually change _REALTIME_VOICE_ADDENDUM or a "
+    "configured realtime prompt overlay, record the exact proposed wording and "
+    "why. Do not blur that into generic Hermes behavior."
+)
 
 
 @dataclass
@@ -255,6 +272,7 @@ class RealtimeVoiceAgentSession:
     last_event_at: float = 0.0
     shadowed_item_ids: Optional[set[str]] = None
     assistant_buffers: Optional[Dict[str, str]] = None
+    review_spawned: bool = False
 
 
 _realtime_voice_sessions: Dict[str, RealtimeVoiceAgentSession] = {}
@@ -2257,6 +2275,82 @@ def _shadow_realtime_event(session: RealtimeVoiceAgentSession, event: Dict[str, 
         _flush_realtime_assistant_buffers(session)
 
 
+def _realtime_voice_review_messages(session: RealtimeVoiceAgentSession) -> List[Dict[str, Any]]:
+    agent = session.agent
+    db = getattr(agent, "_session_db", None)
+    if db is None or not hasattr(db, "get_messages"):
+        return []
+    session_id = getattr(agent, "session_id", "") or f"realtime-voice-{session.call_id}"
+    try:
+        rows = db.get_messages(session_id)
+    except Exception:
+        _log.debug("Realtime voice self-improvement transcript load failed", exc_info=True)
+        return []
+    messages: List[Dict[str, Any]] = []
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        role = row.get("role")
+        if role not in {"user", "assistant", "tool"}:
+            continue
+        content = row.get("content")
+        msg: Dict[str, Any] = {"role": role, "content": content if content is not None else ""}
+        tool_name = row.get("tool_name")
+        if isinstance(tool_name, str) and tool_name:
+            msg["tool_name"] = tool_name
+        tool_call_id = row.get("tool_call_id")
+        if isinstance(tool_call_id, str) and tool_call_id:
+            msg["tool_call_id"] = tool_call_id
+        tool_calls = row.get("tool_calls")
+        if isinstance(tool_calls, list):
+            msg["tool_calls"] = tool_calls
+        messages.append(msg)
+    return messages
+
+
+def _spawn_realtime_voice_background_review(session: RealtimeVoiceAgentSession) -> None:
+    agent = session.agent
+    if getattr(session, "review_spawned", False):
+        return
+    session.review_spawned = True
+    messages = _realtime_voice_review_messages(session)
+    if not any(m.get("role") == "user" and str(m.get("content") or "").strip() for m in messages):
+        return
+    if not hasattr(agent, "_spawn_background_review"):
+        return
+    agent_dict = getattr(agent, "__dict__", {})
+    had_own_prompt = isinstance(agent_dict, dict) and "_COMBINED_REVIEW_PROMPT" in agent_dict
+    previous_prompt = getattr(agent, "_COMBINED_REVIEW_PROMPT", None)
+    base_prompt = previous_prompt if isinstance(previous_prompt, str) else None
+    if not base_prompt:
+        try:
+            from agent.background_review import _COMBINED_REVIEW_PROMPT as base_prompt
+        except Exception:
+            base_prompt = ""
+    try:
+        agent._COMBINED_REVIEW_PROMPT = (base_prompt + _REALTIME_VOICE_REVIEW_PROMPT_ADDENDUM).strip()
+        agent._spawn_background_review(
+            messages_snapshot=messages,
+            review_memory=True,
+            review_skills=True,
+        )
+        _log.info(
+            "Realtime voice self-improvement review spawned call_id=%s messages=%d",
+            session.call_id,
+            len(messages),
+        )
+    except Exception:
+        _log.debug("Realtime voice self-improvement review spawn failed", exc_info=True)
+    finally:
+        try:
+            if had_own_prompt:
+                agent._COMBINED_REVIEW_PROMPT = previous_prompt
+            elif "_COMBINED_REVIEW_PROMPT" in getattr(agent, "__dict__", {}):
+                delattr(agent, "_COMBINED_REVIEW_PROMPT")
+        except Exception:
+            pass
+
+
 def _execute_realtime_agent_tool_call(
     *,
     session: RealtimeVoiceAgentSession,
@@ -2486,6 +2580,7 @@ async def _realtime_sideband_loop(session: RealtimeVoiceAgentSession) -> None:
             _log.exception("Realtime voice sideband loop failed call_id=%s", session.call_id)
     finally:
         _flush_realtime_assistant_buffers(session)
+        _spawn_realtime_voice_background_review(session)
         _log.info("Realtime voice sideband disconnected call_id=%s", session.call_id)
 
 
