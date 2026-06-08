@@ -203,6 +203,13 @@ _DESKTOP_UPLOAD_IMAGE_EXTENSIONS = {
 _DESKTOP_UPLOAD_IMAGE_MAX_BYTES = 25 * 1024 * 1024
 _REALTIME_SDP_MAX_BYTES = 512 * 1024
 _OPENAI_REALTIME_CALLS_URL = "https://api.openai.com/v1/realtime/calls"
+_REALTIME_UNSUPPORTED_AGENT_LOOP_TOOLS = {
+    "delegate_task",
+    "memory",
+    "session_search",
+    "todo",
+}
+_REALTIME_TOOL_RESULT_MAX_CHARS = 12000
 
 # Simple rate limiter for the reveal endpoint
 _reveal_timestamps: List[float] = []
@@ -644,6 +651,13 @@ class TelegramOnboardingApply(BaseModel):
 class AudioTranscriptionRequest(BaseModel):
     data_url: str
     mime_type: Optional[str] = None
+
+
+class RealtimeToolCallRequest(BaseModel):
+    name: str
+    arguments: Dict[str, Any] = {}
+    call_id: Optional[str] = None
+    item_id: Optional[str] = None
 
 
 class ModelAssignment(BaseModel):
@@ -1568,6 +1582,89 @@ def _resolve_realtime_openai_key() -> str:
     )
 
 
+def _realtime_enabled_toolsets(config: Optional[Dict[str, Any]] = None) -> List[str]:
+    cfg = config if isinstance(config, dict) else load_config()
+    try:
+        from hermes_cli.tools_config import _get_platform_tools
+
+        return sorted(
+            str(name)
+            for name in _get_platform_tools(
+                cfg,
+                "cli",
+                include_default_mcp_servers=True,
+            )
+        )
+    except Exception:
+        _log.debug("Realtime voice could not resolve enabled toolsets", exc_info=True)
+        return []
+
+
+def _realtime_tool_definitions(
+    *,
+    config: Optional[Dict[str, Any]] = None,
+) -> Tuple[List[Dict[str, Any]], List[str], List[str]]:
+    enabled_toolsets = _realtime_enabled_toolsets(config)
+    try:
+        from hermes_cli.mcp_startup import wait_for_mcp_discovery
+
+        wait_for_mcp_discovery(timeout=0.75)
+    except Exception:
+        pass
+
+    try:
+        import model_tools
+
+        tool_defs = model_tools.get_tool_definitions(
+            enabled_toolsets=enabled_toolsets,
+            quiet_mode=True,
+        )
+    except Exception:
+        _log.exception("Realtime voice tool definition assembly failed")
+        return [], enabled_toolsets, []
+
+    filtered: List[Dict[str, Any]] = []
+    skipped: List[str] = []
+    for tool_def in tool_defs or []:
+        name = str((tool_def.get("function") or {}).get("name") or "")
+        if name in _REALTIME_UNSUPPORTED_AGENT_LOOP_TOOLS:
+            skipped.append(name)
+            continue
+        filtered.append(tool_def)
+    return filtered, enabled_toolsets, sorted(skipped)
+
+
+def _realtime_voice_instructions(
+    *,
+    tool_count: int,
+    skipped_tools: List[str],
+) -> str:
+    skipped_note = ""
+    if skipped_tools:
+        skipped_note = (
+            "\nSome normal Hermes agent-loop tools are not available in this "
+            f"voice slice yet: {', '.join(skipped_tools)}. If the user asks "
+            "for those, say that voice can use external tools now but that "
+            "agent-loop memory/planning/delegation needs the next integration."
+        )
+    return (
+        "You are Hermes voice mode inside John's Hermes dashboard. "
+        "Speak naturally, briefly, and clearly. You are allowed to call the "
+        f"Hermes server tools exposed in this session ({tool_count} tools). "
+        "The tools execute on John's Hermes server, so never claim you used a "
+        "tool until the tool result has been returned. "
+        "For MCP or plugin tools hidden behind Tool Search, use tool_search to "
+        "find candidates, tool_describe to inspect the schema, then tool_call "
+        "to invoke the selected tool. "
+        "Before destructive actions, external sends, purchases, deletes, broad "
+        "file rewrites, or credential changes, ask John for explicit spoken "
+        "confirmation. If a tool result is long, summarize the useful part and "
+        "offer to continue. "
+        "If no tool is needed, just answer conversationally."
+        f"{skipped_note}"
+    )
+
+
 def _default_realtime_session_config() -> Dict[str, Any]:
     cfg = load_config()
     realtime_cfg = cfg.get("realtime", {})
@@ -1583,20 +1680,21 @@ def _default_realtime_session_config() -> Dict[str, Any]:
         or str(realtime_cfg.get("voice", "") or "").strip()
         or "marin"
     )
+    tools, _enabled_toolsets, skipped_tools = _realtime_tool_definitions(config=cfg)
     return {
         "type": "realtime",
         "model": model,
-        "instructions": (
-            "You are Hermes voice mode, running as a first-slice realtime "
-            "voice prototype inside the Hermes dashboard. No tools are "
-            "available yet. Keep replies concise and conversational."
+        "instructions": _realtime_voice_instructions(
+            tool_count=len(tools),
+            skipped_tools=skipped_tools,
         ),
         "audio": {
             "output": {
                 "voice": voice,
             },
         },
-        "tools": [],
+        "tools": tools,
+        "tool_choice": "auto",
     }
 
 
@@ -1653,9 +1751,85 @@ def _post_openai_realtime_call(
     return answer, call_id
 
 
+def _truncate_realtime_tool_output(output: str) -> str:
+    if len(output) <= _REALTIME_TOOL_RESULT_MAX_CHARS:
+        return output
+    omitted = len(output) - _REALTIME_TOOL_RESULT_MAX_CHARS
+    return (
+        output[:_REALTIME_TOOL_RESULT_MAX_CHARS]
+        + f"\n\n[Hermes voice truncated {omitted} characters from this tool result.]"
+    )
+
+
+def _execute_realtime_tool_call(
+    *,
+    name: str,
+    arguments: Dict[str, Any],
+    call_id: str,
+) -> str:
+    if name in _REALTIME_UNSUPPORTED_AGENT_LOOP_TOOLS:
+        return json.dumps(
+            {
+                "error": (
+                    f"{name} is a Hermes agent-loop tool and is not available "
+                    "in realtime voice yet."
+                ),
+                "status": "unsupported",
+            },
+            ensure_ascii=False,
+        )
+
+    enabled_toolsets = _realtime_enabled_toolsets()
+    try:
+        import model_tools
+
+        available_defs = model_tools.get_tool_definitions(
+            enabled_toolsets=enabled_toolsets,
+            quiet_mode=True,
+        )
+        available_names = {
+            str((tool_def.get("function") or {}).get("name") or "")
+            for tool_def in available_defs
+        }
+    except Exception:
+        _log.exception("Realtime voice tool availability check failed")
+        available_names = set()
+
+    if name not in available_names:
+        return json.dumps(
+            {
+                "error": f"{name} is not available in this realtime voice session.",
+                "status": "unavailable",
+            },
+            ensure_ascii=False,
+        )
+
+    try:
+        import model_tools
+
+        result = model_tools.handle_function_call(
+            function_name=name,
+            function_args=arguments if isinstance(arguments, dict) else {},
+            task_id="realtime-voice",
+            tool_call_id=call_id,
+            session_id="realtime-voice",
+            user_task="Hermes realtime voice conversation",
+            enabled_toolsets=enabled_toolsets,
+        )
+    except Exception as exc:
+        _log.exception("Realtime voice tool call failed: %s", name)
+        result = json.dumps(
+            {"error": f"Realtime voice tool call failed: {exc}", "status": "error"},
+            ensure_ascii=False,
+        )
+    if not isinstance(result, str):
+        result = json.dumps(result, ensure_ascii=False, default=str)
+    return _truncate_realtime_tool_output(result)
+
+
 @app.post("/api/realtime/voice/sdp")
 async def create_realtime_voice_sdp(request: Request):
-    """Create a no-tools OpenAI Realtime WebRTC call for the dashboard overlay."""
+    """Create an OpenAI Realtime WebRTC call for the dashboard voice overlay."""
     content_type = (request.headers.get("content-type") or "").split(";", 1)[0].strip().lower()
     if content_type != "application/sdp":
         raise HTTPException(status_code=415, detail="Expected application/sdp")
@@ -1710,6 +1884,30 @@ async def create_realtime_voice_sdp(request: Request):
     if call_id:
         headers["X-Hermes-Realtime-Call"] = call_id
     return Response(content=answer_sdp, media_type="application/sdp", headers=headers)
+
+
+@app.post("/api/realtime/voice/tool")
+async def execute_realtime_voice_tool(body: RealtimeToolCallRequest):
+    """Execute one Realtime-requested Hermes tool call server-side."""
+    name = (body.name or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Tool name is required")
+    if not isinstance(body.arguments, dict):
+        raise HTTPException(status_code=400, detail="Tool arguments must be an object")
+
+    call_id = (body.call_id or body.item_id or f"realtime-{secrets.token_hex(8)}").strip()
+    result = await asyncio.to_thread(
+        _execute_realtime_tool_call,
+        name=name,
+        arguments=body.arguments,
+        call_id=call_id,
+    )
+    return {
+        "ok": True,
+        "name": name,
+        "call_id": call_id,
+        "output": result,
+    }
 
 
 class TTSSpeakRequest(BaseModel):

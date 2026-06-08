@@ -1,5 +1,8 @@
 """Contract tests for the dashboard Realtime voice SDP endpoint."""
 
+import sys
+from types import SimpleNamespace
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -26,6 +29,20 @@ ANSWER_SDP = (
     "a=rtpmap:111 opus/48000/2\r\n"
 )
 
+TOOL_ENDPOINT = "/api/realtime/voice/tool"
+FAKE_TOOL_DEF = {
+    "type": "function",
+    "function": {
+        "name": "web_search",
+        "description": "Search the web",
+        "parameters": {
+            "type": "object",
+            "properties": {"query": {"type": "string"}},
+            "required": ["query"],
+        },
+    },
+}
+
 
 @pytest.fixture
 def client():
@@ -50,6 +67,13 @@ def _auth_headers() -> dict[str, str]:
         web_server._SESSION_HEADER_NAME: web_server._SESSION_TOKEN,
         "Content-Type": "application/sdp",
         "Accept": "application/sdp",
+    }
+
+
+def _json_auth_headers() -> dict[str, str]:
+    return {
+        web_server._SESSION_HEADER_NAME: web_server._SESSION_TOKEN,
+        "Content-Type": "application/json",
     }
 
 
@@ -90,6 +114,11 @@ def test_realtime_voice_sdp_accepts_sdp_and_returns_answer_text(
 
     monkeypatch.setenv("VOICE_TOOLS_OPENAI_KEY", "sk-test-realtime")
     monkeypatch.setattr(web_server, "load_env", lambda: {})
+    monkeypatch.setattr(
+        web_server,
+        "_realtime_tool_definitions",
+        lambda config=None: ([FAKE_TOOL_DEF], ["web"], ["memory"]),
+    )
 
     def fake_post_openai_realtime_call(**kwargs):
         captured.update(kwargs)
@@ -111,7 +140,9 @@ def test_realtime_voice_sdp_accepts_sdp_and_returns_answer_text(
     assert captured["api_key"] == "sk-test-realtime"
     assert captured["session"]["type"] == "realtime"
     assert captured["session"]["audio"]["output"]["voice"] == "marin"
-    assert captured["session"]["tools"] == []
+    assert captured["session"]["tool_choice"] == "auto"
+    assert captured["session"]["tools"] == [FAKE_TOOL_DEF]
+    assert "memory" in captured["session"]["instructions"]
 
 
 def test_openai_realtime_call_uses_ga_multipart_shape(monkeypatch):
@@ -142,6 +173,11 @@ def test_openai_realtime_call_uses_ga_multipart_shape(monkeypatch):
 
     monkeypatch.setattr(web_server.urllib.request, "Request", fake_request)
     monkeypatch.setattr(web_server.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(
+        web_server,
+        "_realtime_tool_definitions",
+        lambda config=None: ([FAKE_TOOL_DEF], ["web"], []),
+    )
 
     answer, call_id = web_server._post_openai_realtime_call(
         sdp=OFFER_SDP,
@@ -166,3 +202,90 @@ def test_openai_realtime_call_uses_ga_multipart_shape(monkeypatch):
     assert 'name="session"' in data
     assert '"type":"realtime"' in data
     assert '"audio":{"output":{"voice":"marin"}}' in data
+    assert '"tool_choice":"auto"' in data
+    assert '"name":"web_search"' in data
+
+
+def test_realtime_voice_tool_endpoint_executes_authenticated_call(
+    client,
+    monkeypatch,
+):
+    captured: dict[str, object] = {}
+
+    def fake_execute_realtime_tool_call(**kwargs):
+        captured.update(kwargs)
+        return '{"ok": true, "result": "hello"}'
+
+    monkeypatch.setattr(
+        web_server,
+        "_execute_realtime_tool_call",
+        fake_execute_realtime_tool_call,
+    )
+
+    response = client.post(
+        TOOL_ENDPOINT,
+        json={
+            "name": "web_search",
+            "arguments": {"query": "Hermes"},
+            "call_id": "call_123",
+        },
+        headers=_json_auth_headers(),
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "ok": True,
+        "name": "web_search",
+        "call_id": "call_123",
+        "output": '{"ok": true, "result": "hello"}',
+    }
+    assert captured == {
+        "name": "web_search",
+        "arguments": {"query": "Hermes"},
+        "call_id": "call_123",
+    }
+
+
+def test_realtime_tool_execution_uses_scoped_model_tools(monkeypatch):
+    captured: dict[str, object] = {}
+
+    def fake_get_tool_definitions(**kwargs):
+        captured["tool_defs_kwargs"] = kwargs
+        return [FAKE_TOOL_DEF]
+
+    def fake_handle_function_call(**kwargs):
+        captured["handle_kwargs"] = kwargs
+        return '{"result": "ok"}'
+
+    fake_model_tools = SimpleNamespace(
+        get_tool_definitions=fake_get_tool_definitions,
+        handle_function_call=fake_handle_function_call,
+    )
+    monkeypatch.setitem(sys.modules, "model_tools", fake_model_tools)
+    monkeypatch.setattr(web_server, "_realtime_enabled_toolsets", lambda: ["web", "mcp-files"])
+
+    result = web_server._execute_realtime_tool_call(
+        name="web_search",
+        arguments={"query": "Hermes"},
+        call_id="call_456",
+    )
+
+    assert result == '{"result": "ok"}'
+    assert captured["tool_defs_kwargs"] == {
+        "enabled_toolsets": ["web", "mcp-files"],
+        "quiet_mode": True,
+    }
+    assert captured["handle_kwargs"]["function_name"] == "web_search"
+    assert captured["handle_kwargs"]["function_args"] == {"query": "Hermes"}
+    assert captured["handle_kwargs"]["tool_call_id"] == "call_456"
+    assert captured["handle_kwargs"]["enabled_toolsets"] == ["web", "mcp-files"]
+
+
+def test_realtime_tool_execution_rejects_agent_loop_tool():
+    result = web_server._execute_realtime_tool_call(
+        name="memory",
+        arguments={},
+        call_id="call_memory",
+    )
+
+    assert "not available in realtime voice yet" in result

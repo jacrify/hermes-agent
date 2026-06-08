@@ -13,7 +13,17 @@ interface VoiceLogItem {
   text: string;
 }
 
+interface RealtimeFunctionCallItem {
+  id?: string;
+  type?: string;
+  name?: string;
+  arguments?: string;
+  call_id?: string;
+  status?: string;
+}
+
 const SDP_ENDPOINT = "/api/realtime/voice/sdp";
+const TOOL_ENDPOINT = "/api/realtime/voice/tool";
 const MAX_LOG_ITEMS = 5;
 
 function voicePrerequisiteError(): string | null {
@@ -78,6 +88,47 @@ function eventTypeFromMessage(message: MessageEvent<string>): string {
   return "message";
 }
 
+function parseRealtimeMessage(message: MessageEvent<string>): Record<string, unknown> | null {
+  if (typeof message.data !== "string") return null;
+  try {
+    const parsed = JSON.parse(message.data) as unknown;
+    return parsed && typeof parsed === "object" ? parsed as Record<string, unknown> : null;
+  } catch {
+    return null;
+  }
+}
+
+function functionCallFromRealtimeEvent(
+  event: Record<string, unknown>,
+): RealtimeFunctionCallItem | null {
+  const item = event.item;
+  if (item && typeof item === "object") {
+    const candidate = item as RealtimeFunctionCallItem;
+    if (candidate.type === "function_call" && candidate.name) {
+      return candidate;
+    }
+  }
+  if (event.type === "conversation.item.done" && event.item && typeof event.item === "object") {
+    const candidate = event.item as RealtimeFunctionCallItem;
+    if (candidate.type === "function_call" && candidate.name) {
+      return candidate;
+    }
+  }
+  return null;
+}
+
+function parseFunctionArguments(raw: string | undefined): Record<string, unknown> {
+  if (!raw) return {};
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : {};
+  } catch {
+    return {};
+  }
+}
+
 export function RealtimeVoiceOverlay({ active = true }: { active?: boolean }) {
   const [voiceState, setVoiceState] = useState<VoiceState>("idle");
   const [prerequisiteError, setPrerequisiteError] = useState<string | null>(() =>
@@ -93,6 +144,7 @@ export function RealtimeVoiceOverlay({ active = true }: { active?: boolean }) {
   const logIdRef = useRef(0);
   const startRunIdRef = useRef(0);
   const startInFlightRef = useRef(false);
+  const executingToolCallsRef = useRef<Set<string>>(new Set());
 
   const pushLog = useCallback((text: string, tone: VoiceLogItem["tone"] = "event") => {
     setLogs((current) => [
@@ -116,6 +168,7 @@ export function RealtimeVoiceOverlay({ active = true }: { active?: boolean }) {
       }
     }
     dataChannelRef.current = null;
+    executingToolCallsRef.current.clear();
 
     const pc = pcRef.current;
     if (pc) {
@@ -141,6 +194,84 @@ export function RealtimeVoiceOverlay({ active = true }: { active?: boolean }) {
       audio.srcObject = null;
     }
   }, []);
+
+  const executeRealtimeToolCall = useCallback(async (item: RealtimeFunctionCallItem) => {
+    const channel = dataChannelRef.current;
+    if (!channel || channel.readyState !== "open") return;
+
+    const name = item.name?.trim();
+    if (!name) return;
+
+    const callId = item.call_id || item.id || `voice-${Date.now()}`;
+    const dedupeKey = `${callId}:${name}`;
+    if (executingToolCallsRef.current.has(dedupeKey)) return;
+    executingToolCallsRef.current.add(dedupeKey);
+
+    pushLog(`tool.${name}`);
+    try {
+      const response = await authedFetch(TOOL_ENDPOINT, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          name,
+          arguments: parseFunctionArguments(item.arguments),
+          call_id: item.call_id,
+          item_id: item.id,
+        }),
+      });
+
+      if (!response.ok) {
+        const text = await response.text().catch(() => response.statusText);
+        throw new Error(`${response.status}: ${text || response.statusText}`);
+      }
+
+      const payload = await response.json() as { output?: unknown; call_id?: string };
+      const output = typeof payload.output === "string"
+        ? payload.output
+        : JSON.stringify(payload.output ?? "", null, 2);
+
+      if (channel.readyState !== "open") return;
+      channel.send(JSON.stringify({
+        type: "conversation.item.create",
+        item: {
+          type: "function_call_output",
+          call_id: payload.call_id || callId,
+          output,
+        },
+      }));
+      channel.send(JSON.stringify({ type: "response.create" }));
+      pushLog(`tool.${name}.done`);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Tool call failed";
+      pushLog(`tool.${name}.error`, "error");
+      setErrorMessage(message);
+      if (channel.readyState === "open") {
+        channel.send(JSON.stringify({
+          type: "conversation.item.create",
+          item: {
+            type: "function_call_output",
+            call_id: callId,
+            output: JSON.stringify({ error: message }),
+          },
+        }));
+        channel.send(JSON.stringify({ type: "response.create" }));
+      }
+    } finally {
+      executingToolCallsRef.current.delete(dedupeKey);
+    }
+  }, [pushLog]);
+
+  const handleRealtimeMessage = useCallback((message: MessageEvent<string>) => {
+    pushLog(eventTypeFromMessage(message));
+    const event = parseRealtimeMessage(message);
+    if (!event) return;
+    const functionCall = functionCallFromRealtimeEvent(event);
+    if (functionCall) {
+      void executeRealtimeToolCall(functionCall);
+    }
+  }, [executeRealtimeToolCall, pushLog]);
 
   const stopVoice = useCallback(() => {
     teardownVoice();
@@ -230,7 +361,7 @@ export function RealtimeVoiceOverlay({ active = true }: { active?: boolean }) {
         setVoiceState("live");
       };
       dataChannel.onmessage = (message: MessageEvent<string>) => {
-        pushLog(eventTypeFromMessage(message));
+        handleRealtimeMessage(message);
       };
       dataChannel.onerror = () => {
         pushLog("datachannel.error", "error");
@@ -282,7 +413,7 @@ export function RealtimeVoiceOverlay({ active = true }: { active?: boolean }) {
     } finally {
       startInFlightRef.current = false;
     }
-  }, [pushLog, stopVoice, teardownVoice, voiceState]);
+  }, [handleRealtimeMessage, pushLog, stopVoice, teardownVoice, voiceState]);
 
   useEffect(() => teardownVoice, [teardownVoice]);
   useEffect(() => {
