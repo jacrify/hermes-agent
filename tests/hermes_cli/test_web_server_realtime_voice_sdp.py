@@ -43,6 +43,58 @@ FAKE_TOOL_DEF = {
         },
     },
 }
+
+FAKE_TOOL_SEARCH_DEF = {
+    "type": "function",
+    "function": {
+        "name": "tool_search",
+        "description": "Search deferred tools",
+        "parameters": {
+            "type": "object",
+            "properties": {"query": {"type": "string"}},
+            "required": ["query"],
+        },
+    },
+}
+FAKE_TOOL_DESCRIBE_DEF = {
+    "type": "function",
+    "function": {
+        "name": "tool_describe",
+        "description": "Describe a deferred tool",
+        "parameters": {
+            "type": "object",
+            "properties": {"name": {"type": "string"}},
+            "required": ["name"],
+        },
+    },
+}
+FAKE_TOOL_CALL_DEF = {
+    "type": "function",
+    "function": {
+        "name": "tool_call",
+        "description": "Call a deferred tool",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "arguments": {"type": "object"},
+            },
+            "required": ["name", "arguments"],
+        },
+    },
+}
+FAKE_RAW_MCP_TOOL_DEF = {
+    "type": "function",
+    "function": {
+        "name": "mcp_slack_send_message",
+        "description": "Send a Slack message",
+        "parameters": {
+            "type": "object",
+            "properties": {"channel_id": {"type": "string"}},
+            "required": ["channel_id"],
+        },
+    },
+}
 FAKE_REALTIME_TOOL_DEF = {
     "type": "function",
     "name": "web_search",
@@ -105,6 +157,15 @@ def _json_auth_headers() -> dict[str, str]:
     }
 
 
+def _install_fake_model_tools(monkeypatch, tool_defs=None):
+    fake_model_tools = SimpleNamespace(
+        get_tool_definitions=lambda **_kwargs: list(tool_defs or [FAKE_TOOL_DEF]),
+    )
+    monkeypatch.setitem(sys.modules, "model_tools", fake_model_tools)
+    monkeypatch.setattr(web_server, "_refresh_realtime_mcp_tools", lambda: None)
+    return fake_model_tools
+
+
 def test_realtime_voice_sdp_requires_dashboard_session_token(client):
     response = client.post(
         SDP_ENDPOINT,
@@ -142,6 +203,7 @@ def test_realtime_voice_sdp_accepts_sdp_and_returns_answer_text(
 
     monkeypatch.setenv("VOICE_TOOLS_OPENAI_KEY", "sk-test-realtime")
     monkeypatch.setattr(web_server, "load_env", lambda: {})
+    _install_fake_model_tools(monkeypatch)
     monkeypatch.setattr(web_server, "_create_realtime_voice_agent", lambda **_kwargs: FakeRealtimeAgent())
     monkeypatch.setattr(web_server, "_start_realtime_voice_sideband", lambda **_kwargs: None)
 
@@ -161,6 +223,8 @@ def test_realtime_voice_sdp_accepts_sdp_and_returns_answer_text(
     assert response.text == ANSWER_SDP
     assert response.headers["content-type"].startswith("application/sdp")
     assert response.headers["x-hermes-realtime-call"] == "call_test_123"
+    assert response.headers["x-hermes-realtime-tool-owner"] == "browser"
+    assert "x-hermes-realtime-sideband" not in response.headers
     assert captured["sdp"] == OFFER_SDP
     assert captured["api_key"] == "sk-test-realtime"
     assert captured["session"]["type"] == "realtime"
@@ -173,7 +237,9 @@ def test_realtime_voice_sdp_accepts_sdp_and_returns_answer_text(
 
 
 def test_default_realtime_session_config_uses_chat_agent_prompt_plus_voice_addendum(monkeypatch):
+    monkeypatch.delenv("HERMES_REALTIME_MODEL", raising=False)
     monkeypatch.setattr(web_server, "load_config", lambda: {"terminal": {"cwd": ""}})
+    _install_fake_model_tools(monkeypatch)
 
     session = web_server._default_realtime_session_config(agent=FakeRealtimeAgent())
 
@@ -196,10 +262,7 @@ def test_realtime_tool_definitions_flatten_chat_completion_tool_shape(monkeypatc
         raising=False,
     )
 
-    fake_model_tools = SimpleNamespace(
-        get_tool_definitions=lambda **_kwargs: [FAKE_TOOL_DEF],
-    )
-    monkeypatch.setitem(sys.modules, "model_tools", fake_model_tools)
+    fake_model_tools = _install_fake_model_tools(monkeypatch)
 
     tools, enabled_toolsets, skipped_tools = web_server._realtime_tool_definitions()
 
@@ -208,9 +271,30 @@ def test_realtime_tool_definitions_flatten_chat_completion_tool_shape(monkeypatc
     assert skipped_tools == []
 
 
-def test_realtime_tool_definitions_from_agent_include_agent_loop_tools():
+def test_realtime_tool_definitions_from_agent_use_tool_search_bridge(monkeypatch):
     agent = FakeRealtimeAgent()
-    agent.tools = [
+    _install_fake_model_tools(
+        monkeypatch,
+        [
+            FAKE_TOOL_DEF,
+            FAKE_TOOL_SEARCH_DEF,
+            FAKE_TOOL_DESCRIBE_DEF,
+            FAKE_TOOL_CALL_DEF,
+        ],
+    )
+
+    tools = web_server._realtime_tool_definitions_from_agent(agent)
+
+    names = {tool["name"] for tool in tools}
+    assert {"web_search", "tool_search", "tool_describe", "tool_call"} <= names
+    assert "mcp_slack_send_message" not in names
+    assert {"web_search", "tool_search", "tool_describe", "tool_call"} <= agent.valid_tool_names
+    assert all(tool["type"] == "function" for tool in tools)
+
+
+def test_realtime_tool_definitions_from_agent_preserve_agent_loop_tools(monkeypatch):
+    agent = FakeRealtimeAgent()
+    loop_tool_defs = [
         FAKE_TOOL_DEF,
         {
             "type": "function",
@@ -229,6 +313,7 @@ def test_realtime_tool_definitions_from_agent_include_agent_loop_tools():
             "function": {"name": "session_search", "description": "Search sessions", "parameters": {"type": "object"}},
         },
     ]
+    _install_fake_model_tools(monkeypatch, loop_tool_defs)
 
     tools = web_server._realtime_tool_definitions_from_agent(agent)
 
@@ -342,7 +427,7 @@ def test_realtime_tool_execution_uses_scoped_model_tools(monkeypatch):
     captured: dict[str, object] = {}
 
     def fake_get_tool_definitions(**kwargs):
-        captured["tool_defs_kwargs"] = kwargs
+        captured.setdefault("tool_defs_calls", []).append(kwargs)
         return [FAKE_TOOL_DEF]
 
     def fake_handle_function_call(**kwargs):
@@ -363,10 +448,17 @@ def test_realtime_tool_execution_uses_scoped_model_tools(monkeypatch):
     )
 
     assert result == '{"result": "ok"}'
-    assert captured["tool_defs_kwargs"] == {
-        "enabled_toolsets": ["web", "mcp-files"],
-        "quiet_mode": True,
-    }
+    assert captured["tool_defs_calls"] == [
+        {
+            "enabled_toolsets": ["web", "mcp-files"],
+            "quiet_mode": True,
+            "skip_tool_search_assembly": True,
+        },
+        {
+            "enabled_toolsets": ["web", "mcp-files"],
+            "quiet_mode": True,
+        },
+    ]
     assert captured["handle_kwargs"]["function_name"] == "web_search"
     assert captured["handle_kwargs"]["function_args"] == {"query": "Hermes"}
     assert captured["handle_kwargs"]["tool_call_id"] == "call_456"

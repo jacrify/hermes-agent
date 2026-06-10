@@ -1695,7 +1695,25 @@ def _realtime_tool_definition(tool_def: Dict[str, Any]) -> Optional[Dict[str, An
     realtime_tool: Dict[str, Any] = {"type": "function", "name": name}
 
     description = source.get("description")
-    if isinstance(description, str) and description.strip():
+    if name == "tool_search":
+        realtime_tool["description"] = (
+            "Search Hermes' deferred tool catalog. Use this immediately for any "
+            "request involving Slack, Atlassian, Jira, Confluence, MCP, plugins, "
+            "or a tool that is not directly listed in this Realtime session. "
+            "Do not verbally say you are searching; call this function instead. "
+            "Then use tool_describe and tool_call if the user wants an action."
+        )
+    elif name == "tool_describe":
+        realtime_tool["description"] = (
+            "Get the exact JSON schema for one tool returned by tool_search. "
+            "Use before tool_call when you do not know the required arguments."
+        )
+    elif name == "tool_call":
+        realtime_tool["description"] = (
+            "Invoke one deferred Hermes tool returned by tool_search/tool_describe. "
+            "Approvals, Rorschach permissions, and plugin hooks run server-side."
+        )
+    elif isinstance(description, str) and description.strip():
         realtime_tool["description"] = description
 
     parameters = source.get("parameters")
@@ -1705,21 +1723,47 @@ def _realtime_tool_definition(tool_def: Dict[str, Any]) -> Optional[Dict[str, An
     return realtime_tool
 
 
+def _refresh_realtime_mcp_tools() -> None:
+    try:
+        from hermes_cli.mcp_startup import wait_for_mcp_discovery
+        from tools.mcp_tool import discover_mcp_tools
+
+        wait_for_mcp_discovery(timeout=0.75)
+        discover_mcp_tools()
+    except Exception:
+        _log.debug("Realtime voice MCP discovery refresh failed", exc_info=True)
+
+
+def _filter_realtime_tool_definitions(
+    tool_defs: List[Dict[str, Any]],
+    *,
+    skip_agent_loop_tools: bool = True,
+) -> Tuple[List[Dict[str, Any]], List[str]]:
+    filtered: List[Dict[str, Any]] = []
+    skipped: List[str] = []
+    for tool_def in tool_defs or []:
+        name = _tool_name_from_definition(tool_def)
+        if skip_agent_loop_tools and name in _REALTIME_UNSUPPORTED_AGENT_LOOP_TOOLS:
+            skipped.append(name)
+            continue
+        realtime_tool = _realtime_tool_definition(tool_def)
+        if realtime_tool:
+            filtered.append(realtime_tool)
+    return filtered, sorted(skipped)
+
+
 def _realtime_tool_definitions(
     *,
     config: Optional[Dict[str, Any]] = None,
 ) -> Tuple[List[Dict[str, Any]], List[str], List[str]]:
     enabled_toolsets = _realtime_enabled_toolsets(config)
-    try:
-        from hermes_cli.mcp_startup import wait_for_mcp_discovery
-
-        wait_for_mcp_discovery(timeout=0.75)
-    except Exception:
-        pass
+    _refresh_realtime_mcp_tools()
 
     try:
         import model_tools
 
+        # Let Hermes' normal tool assembly decide which tools are direct and
+        # which MCP/plugin tools are deferred behind tool_search/describe/call.
         tool_defs = model_tools.get_tool_definitions(
             enabled_toolsets=enabled_toolsets,
             quiet_mode=True,
@@ -1728,17 +1772,8 @@ def _realtime_tool_definitions(
         _log.exception("Realtime voice tool definition assembly failed")
         return [], enabled_toolsets, []
 
-    filtered: List[Dict[str, Any]] = []
-    skipped: List[str] = []
-    for tool_def in tool_defs or []:
-        name = _tool_name_from_definition(tool_def)
-        if name in _REALTIME_UNSUPPORTED_AGENT_LOOP_TOOLS:
-            skipped.append(name)
-            continue
-        realtime_tool = _realtime_tool_definition(tool_def)
-        if realtime_tool:
-            filtered.append(realtime_tool)
-    return filtered, enabled_toolsets, sorted(skipped)
+    filtered, skipped = _filter_realtime_tool_definitions(tool_defs or [])
+    return filtered, enabled_toolsets, skipped
 
 
 def _realtime_agent_model_config(config: Optional[Dict[str, Any]] = None) -> Tuple[str, Optional[str]]:
@@ -1877,12 +1912,31 @@ def _create_realtime_voice_agent(
 
 
 def _realtime_tool_definitions_from_agent(agent: Any) -> List[Dict[str, Any]]:
-    tools: List[Dict[str, Any]] = []
-    for tool_def in getattr(agent, "tools", []) or []:
-        realtime_tool = _realtime_tool_definition(tool_def)
-        if realtime_tool:
-            tools.append(realtime_tool)
-    return tools
+    _refresh_realtime_mcp_tools()
+    try:
+        import model_tools
+
+        assembled_tools = model_tools.get_tool_definitions(
+            enabled_toolsets=getattr(agent, "enabled_toolsets", None),
+            disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+            quiet_mode=True,
+        )
+    except Exception:
+        _log.exception("Realtime voice agent tool refresh failed; using agent snapshot")
+        assembled_tools = getattr(agent, "tools", []) or []
+
+    filtered, _skipped = _filter_realtime_tool_definitions(
+        assembled_tools or [],
+        skip_agent_loop_tools=False,
+    )
+    if assembled_tools:
+        agent.tools = list(assembled_tools)
+        agent.valid_tool_names = {
+            _tool_name_from_definition(tool_def)
+            for tool_def in assembled_tools
+            if _tool_name_from_definition(tool_def)
+        }
+    return filtered
 
 
 def _realtime_voice_agent_instructions(agent: Any) -> str:
@@ -1891,7 +1945,17 @@ def _realtime_voice_agent_instructions(agent: Any) -> str:
     effective = agent._cached_system_prompt or ""
     if getattr(agent, "ephemeral_system_prompt", None):
         effective = (effective + "\n\n" + agent.ephemeral_system_prompt).strip()
-    return (effective + "\n\n" + _REALTIME_VOICE_ADDENDUM).strip()
+    bridge_addendum = (
+        "\n\nRealtime tool-use rule: if the user asks for Slack, Atlassian, Jira, "
+        "Confluence, MCP, plugins, or any capability that is not one of the "
+        "directly visible tools, call tool_search immediately. Do not say you "
+        "are searching, checking, or waiting unless you have already received a "
+        "tool result or a tool error. After tool_search, use tool_describe for "
+        "the selected result when arguments are unclear, then tool_call to invoke "
+        "the real tool. If the user asked for an external send/write, ask for "
+        "explicit confirmation before tool_call."
+    )
+    return (effective + "\n\n" + _REALTIME_VOICE_ADDENDUM + bridge_addendum).strip()
 
 
 def _realtime_voice_instructions(
@@ -1913,9 +1977,10 @@ def _realtime_voice_instructions(
         f"Hermes server tools exposed in this session ({tool_count} tools). "
         "The tools execute on John's Hermes server, so never claim you used a "
         "tool until the tool result has been returned. "
-        "For MCP or plugin tools hidden behind Tool Search, use tool_search to "
-        "find candidates, tool_describe to inspect the schema, then tool_call "
-        "to invoke the selected tool. "
+        "For Slack, Atlassian, Jira, Confluence, MCP, plugins, or any tool "
+        "hidden behind Tool Search, call tool_search immediately; do not say "
+        "you are searching. Then use tool_describe to inspect the schema and "
+        "tool_call to invoke the selected tool. "
         "Before destructive actions, external sends, purchases, deletes, broad "
         "file rewrites, or credential changes, ask John for explicit spoken "
         "confirmation. If a tool result is long, summarize the useful part and "
@@ -2261,6 +2326,7 @@ def _shadow_realtime_event(session: RealtimeVoiceAgentSession, event: Dict[str, 
         return
     if event_type in {
         "response.audio_transcript.delta",
+        "response.output_audio_transcript.delta",
         "response.text.delta",
         "response.output_text.delta",
     }:
@@ -2268,6 +2334,7 @@ def _shadow_realtime_event(session: RealtimeVoiceAgentSession, event: Dict[str, 
         return
     if event_type in {
         "response.audio_transcript.done",
+        "response.output_audio_transcript.done",
         "response.text.done",
         "response.output_text.done",
         "response.done",
@@ -2729,13 +2796,24 @@ def _execute_realtime_tool_call(
 
     enabled_toolsets = _realtime_enabled_toolsets()
     try:
+        from tools.mcp_tool import discover_mcp_tools
         import model_tools
 
-        available_defs = model_tools.get_tool_definitions(
+        discover_mcp_tools()
+        raw_defs = model_tools.get_tool_definitions(
+            enabled_toolsets=enabled_toolsets,
+            quiet_mode=True,
+            skip_tool_search_assembly=True,
+        )
+        assembled_defs = model_tools.get_tool_definitions(
             enabled_toolsets=enabled_toolsets,
             quiet_mode=True,
         )
-        available_names = {_tool_name_from_definition(tool_def) for tool_def in available_defs}
+        available_names = {
+            _tool_name_from_definition(tool_def)
+            for tool_def in [*(raw_defs or []), *(assembled_defs or [])]
+            if _tool_name_from_definition(tool_def)
+        }
     except Exception:
         _log.exception("Realtime voice tool availability check failed")
         available_names = set()
@@ -2847,15 +2925,11 @@ async def create_realtime_voice_sdp(request: Request):
     headers = {"Cache-Control": "no-store"}
     if call_id:
         headers["X-Hermes-Realtime-Call"] = call_id
-    sideband_session = _start_realtime_voice_sideband(
-        raw_call_id=call_id,
-        agent=realtime_agent,
-        api_key=api_key,
-        config=cfg,
-    )
-    if sideband_session is not None:
-        headers["X-Hermes-Realtime-Sideband"] = "1"
-        headers["X-Hermes-Realtime-Session"] = getattr(realtime_agent, "session_id", "")
+    # Let the browser data channel execute Realtime tool calls via
+    # /api/realtime/voice/tool. The OpenAI sideband connection currently does
+    # not receive the browser session's function-call events reliably, which
+    # leaves the model waiting forever after claiming tool use.
+    headers["X-Hermes-Realtime-Tool-Owner"] = "browser"
     return Response(content=answer_sdp, media_type="application/sdp", headers=headers)
 
 
@@ -2910,6 +2984,8 @@ async def shadow_realtime_voice_transcript_event(body: RealtimeTranscriptEventRe
         "conversation.item.created",
         "response.audio_transcript.delta",
         "response.audio_transcript.done",
+        "response.output_audio_transcript.delta",
+        "response.output_audio_transcript.done",
         "response.text.delta",
         "response.text.done",
         "response.output_text.delta",

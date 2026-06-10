@@ -151,6 +151,8 @@ function shouldShadowRealtimeTranscriptEvent(type: unknown): boolean {
     type === "conversation.item.created" ||
     type === "response.audio_transcript.delta" ||
     type === "response.audio_transcript.done" ||
+    type === "response.output_audio_transcript.delta" ||
+    type === "response.output_audio_transcript.done" ||
     type === "response.text.delta" ||
     type === "response.text.done" ||
     type === "response.output_text.delta" ||
@@ -516,6 +518,7 @@ export default function RealtimePage() {
     if (
       assistantDelta &&
       (type === "response.audio_transcript.delta" ||
+        type === "response.output_audio_transcript.delta" ||
         type === "response.text.delta" ||
         type === "response.output_text.delta")
     ) {
@@ -582,6 +585,7 @@ export default function RealtimePage() {
       }
 
       pc.ontrack = (event) => {
+        pushEvent(`audio.track.${event.track.kind}`);
         event.streams[0]?.getAudioTracks().forEach((track) => remoteStream.addTrack(track));
         if (!event.streams[0]) remoteStream.addTrack(event.track);
         void audioRef.current?.play().catch((err: unknown) => {
