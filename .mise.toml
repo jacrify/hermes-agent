@@ -1,0 +1,17 @@
+[tools]
+node = "24"
+python = "3.13"
+
+[tasks."ror:install"]
+description = "Install Hermes dependencies and build the dashboard for Ror"
+run = """
+python -m venv venv
+venv/bin/python -m pip install --upgrade pip setuptools wheel
+venv/bin/pip install -e '.[web,mcp,google]'
+npm install --workspace web
+npm --workspace web run build
+"""
+
+[tasks."ror:start"]
+description = "Start the Hermes dashboard inside a Ror VM"
+run = "exec venv/bin/hermes dashboard --skip-build --no-open --host 127.0.0.1 --port ${HERMES_DASHBOARD_PORT:-9119}"
